@@ -170,12 +170,64 @@ describe("buildTimeline", () => {
     expect(t.months).toEqual([]);
   });
 
-  it("marks only the stalled step overdue, reporting what the API computed", () => {
+  it("falls back to the stall for a step the letters promised no date for", () => {
     const t = timeline(graph(), stall);
     const overdue = t.dated.filter((e) => e.overdue);
     expect(overdue.map((e) => e.node.id)).toEqual(["xray"]);
     expect(overdue[0].overdue?.phrase).toBe("waiting 6 months");
     expect(overdue[0].overdue?.detail).toBe("expected within 28 days");
+  });
+
+  it("states a promised step's lateness against its own due date (AC2)", () => {
+    const g = graph({
+      nodes: [
+        node("culture", {
+          ordered_date: "2026-06-23",
+          dueDate: "2026-07-21",
+          overdue: { daysOverdue: 4, basis: 'Due 21 Jul 2026 — "FU 4 weeks" from 23 Jun 2026.' },
+        }),
+        node("funding"),
+      ],
+      chainIds: ["culture", "funding"],
+    });
+    const entry = timeline(g).dated.find((e) => e.node.id === "culture")!;
+    expect(entry.overdue?.phrase).toBe("due 21 Jul · 4 days overdue");
+    // The clinic's own words, rendered verbatim rather than paraphrased.
+    expect(entry.overdue?.detail).toBe('Due 21 Jul 2026 — "FU 4 weeks" from 23 Jun 2026.');
+  });
+
+  it("flags every promised step that is late, not only the bottleneck (AC2)", () => {
+    const g = graph({
+      nodes: [
+        node("culture", {
+          ordered_date: "2026-06-23",
+          dueDate: "2026-07-01",
+          overdue: { daysOverdue: 24, basis: "Due 1 Jul 2026." },
+        }),
+        node("review", {
+          ordered_date: "2026-06-23",
+          dueDate: "2026-07-21",
+          overdue: { daysOverdue: 4, basis: "Due 21 Jul 2026." },
+        }),
+        node("funding"),
+      ],
+      chainIds: ["culture", "review", "funding"],
+    });
+    const t = timeline(g, { ...stall, stalledNode: node("culture") });
+    expect(t.dated.filter((e) => e.overdue).map((e) => e.node.id)).toEqual(["culture", "review"]);
+  });
+
+  it("says how late without a due date it was never given", () => {
+    const g = graph({
+      nodes: [
+        node("culture", { ordered_date: "2026-06-23", overdue: { daysOverdue: 24, basis: "" } }),
+        node("funding"),
+      ],
+      chainIds: ["culture", "funding"],
+    });
+    const entry = timeline(g).dated.find((e) => e.node.id === "culture")!;
+    expect(entry.overdue?.phrase).toBe("3 weeks overdue");
+    expect(entry.overdue?.detail).toBeNull();
   });
 
   it("never invents a due date the API didn't give", () => {
