@@ -1,162 +1,237 @@
 /**
- * Agent 1 — Extractor (LLM). Turns one NHS letter (text or image) into strict
- * JSON. The LLM ONLY reads what the document says: absent fields are null,
- * dates are never inferred, low confidence is flagged rather than guessed.
- *
- * Without a RUNWARE_API_KEY, a deterministic mock returns coherent output so
- * the whole app runs keyless.
+ * Per-letter extractor. The model reports only what one document says; it
+ * never joins letters or decides which graph node is stalled.
  */
 
 import { getLLM, hasLLMKey, LLM_MODEL, parseJsonLoose } from "../provider";
-import type { DocType, Extraction, StageSignal } from "./types";
+import type {
+  Extraction,
+  InvestigationStatus,
+  InvestigationType,
+} from "./types";
 import { SAMPLE_LETTERS } from "./samples";
 
 export interface ExtractInput {
   /** Use a shipped sample letter's canned extraction (demo path). */
   sampleId?: string;
-  /** Raw letter text. */
   text?: string;
-  /** Base64-encoded image of a letter (used with a real key, vision model). */
   imageBase64?: string;
   imageMime?: string;
 }
 
-const DOC_TYPES: DocType[] = [
-  "referral",
-  "clinic_letter",
-  "test_result",
-  "funding",
-  "homecare",
+const INVESTIGATION_TYPES: InvestigationType[] = [
+  "ct",
+  "mri",
+  "bronchoscopy",
+  "consult",
+  "bloods",
+  "xray",
   "other",
 ];
-const STAGE_SIGNALS: StageSignal[] = [
-  "referral",
-  "screening",
-  "funding",
-  "homecare",
-  "dosing",
+const INVESTIGATION_STATUSES: InvestigationStatus[] = [
+  "ordered",
+  "booked",
+  "done",
+  "reported",
+  "actioned",
   "unknown",
 ];
 
-const SYSTEM_PROMPT = `You extract structured data from a single UK NHS letter about an IBD (inflammatory bowel disease) biologics pathway.
+const SYSTEM_PROMPT = `You extract structured data from ONE UK NHS letter for a cross-department care pathway.
 
-Return STRICT JSON only — no prose, no markdown fences. Use exactly this schema:
+Return STRICT JSON only — no prose and no markdown fences. Use exactly this schema:
 {
-  "date": "YYYY-MM-DD" | null,
-  "doc_type": "referral" | "clinic_letter" | "test_result" | "funding" | "homecare" | "other",
-  "stage_signal": "referral" | "screening" | "funding" | "homecare" | "dosing" | "unknown",
-  "clinician": string | null,
-  "actions_stated": string[],
-  "tests_ordered": string[],
-  "drugs_mentioned": string[],
-  "confidence": number   // 0.0 to 1.0
+  "letter_date": "YYYY-MM-DD" | null,
+  "department": string | null,
+  "clinicians": [{"name": string, "dept": string | null}],
+  "investigations": [{
+    "id": string, "name": string,
+    "type": "ct" | "mri" | "bronchoscopy" | "consult" | "bloods" | "xray" | "other",
+    "ordered_date": "YYYY-MM-DD" | null,
+    "report_date": "YYYY-MM-DD" | null,
+    "status": "ordered" | "booked" | "done" | "reported" | "actioned" | "unknown"
+  }],
+  "findings": [{"text": string, "on_investigation": string | null, "spawned": string | null}],
+  "referrals": [{"from_dept": string | null, "to_dept": string | null, "reason": string | null, "date": "YYYY-MM-DD" | null}],
+  "dependencies": [{"blocked_item": string, "blocking_item": string, "stated_status": string | null}],
+  "mdt": [{"date": "YYYY-MM-DD" | null, "outcome": string | null, "awaiting": string | null}],
+  "confidence": number
 }
 
 Rules:
-- If a field is absent from the document, use null (or [] for lists). Do not invent values.
-- NEVER infer a date that is not written in the document. If no date is written, use null.
-- Do not diagnose or decide clinical urgency. Only report what the letter states.
-- If the document is unclear, lower "confidence" rather than guessing.`;
+- Extract only facts written in this letter. Never infer a date; use null when it is not written.
+- Keep the department and clinician department as written, without inventing ownership.
+- Normalize investigation type to one of the enum values above.
+- Use a short slug for each investigation id, unique within this letter.
+- A finding may name the investigation it appears on and the next investigation it spawned; otherwise use null.
+- A dependency is the explicit relationship in wording such as “awaiting X before Y”.
+- Do not diagnose, interpret, prioritize, or decide urgency. Lower confidence rather than guessing.`;
 
-/** Coerce arbitrary model/heuristic output into a valid Extraction. */
+function isISODate(value: unknown): value is string {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+function nullableString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean)
+    : [];
+}
+
+function slug(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "item";
+}
+
+function normalizeType(value: unknown, name = ""): InvestigationType {
+  const text = `${typeof value === "string" ? value : ""} ${name}`.toLowerCase();
+  if (/bronch/.test(text)) return "bronchoscopy";
+  if (/\bct\b|computed tomography/.test(text)) return "ct";
+  if (/\bmri\b|magnetic resonance/.test(text)) return "mri";
+  if (/consult|clearance|review/.test(text)) return "consult";
+  if (/blood|\bigra\b|screening/.test(text)) return "bloods";
+  if (/x[- ]?ray|radiograph/.test(text)) return "xray";
+  return INVESTIGATION_TYPES.includes(value as InvestigationType)
+    ? (value as InvestigationType)
+    : "other";
+}
+
 function normalize(raw: unknown): Extraction {
   const o = (raw ?? {}) as Record<string, unknown>;
-  const asStrArray = (v: unknown): string[] =>
-    Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
-  const date =
-    typeof o.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(o.date) ? o.date : null;
-  const doc_type = DOC_TYPES.includes(o.doc_type as DocType)
-    ? (o.doc_type as DocType)
-    : "other";
-  const stage_signal = STAGE_SIGNALS.includes(o.stage_signal as StageSignal)
-    ? (o.stage_signal as StageSignal)
-    : "unknown";
-  let confidence = typeof o.confidence === "number" ? o.confidence : 0.5;
-  confidence = Math.max(0, Math.min(1, confidence));
+  const rawInvestigations = Array.isArray(o.investigations) ? o.investigations : [];
+  const investigations = rawInvestigations.map((item, index) => {
+    const value = (item ?? {}) as Record<string, unknown>;
+    const name = nullableString(value.name) ?? `Investigation ${index + 1}`;
+    const id = slug(nullableString(value.id) ?? name);
+    const status = INVESTIGATION_STATUSES.includes(value.status as InvestigationStatus)
+      ? (value.status as InvestigationStatus)
+      : "unknown";
+    return {
+      id: `${id}-${index + 1}`,
+      name,
+      type: normalizeType(value.type, name),
+      ordered_date: isISODate(value.ordered_date) ? value.ordered_date : null,
+      report_date: isISODate(value.report_date) ? value.report_date : null,
+      status,
+    };
+  });
+
+  const clinicians = (Array.isArray(o.clinicians) ? o.clinicians : []).flatMap((item) => {
+    const value = (item ?? {}) as Record<string, unknown>;
+    const name = nullableString(value.name);
+    return name ? [{ name, dept: nullableString(value.dept) }] : [];
+  });
+  const findings = (Array.isArray(o.findings) ? o.findings : []).flatMap((item) => {
+    const value = (item ?? {}) as Record<string, unknown>;
+    const text = nullableString(value.text);
+    return text
+      ? [{
+          text,
+          on_investigation: nullableString(value.on_investigation),
+          spawned: nullableString(value.spawned),
+        }]
+      : [];
+  });
+  const referrals = (Array.isArray(o.referrals) ? o.referrals : []).map((item) => {
+    const value = (item ?? {}) as Record<string, unknown>;
+    return {
+      from_dept: nullableString(value.from_dept),
+      to_dept: nullableString(value.to_dept),
+      reason: nullableString(value.reason),
+      date: isISODate(value.date) ? value.date : null,
+    };
+  });
+  const dependencies = (Array.isArray(o.dependencies) ? o.dependencies : []).flatMap((item) => {
+    const value = (item ?? {}) as Record<string, unknown>;
+    const blocked = nullableString(value.blocked_item);
+    const blocking = nullableString(value.blocking_item);
+    return blocked && blocking
+      ? [{ blocked_item: blocked, blocking_item: blocking, stated_status: nullableString(value.stated_status) }]
+      : [];
+  });
+  const mdt = (Array.isArray(o.mdt) ? o.mdt : []).map((item) => {
+    const value = (item ?? {}) as Record<string, unknown>;
+    return {
+      date: isISODate(value.date) ? value.date : null,
+      outcome: nullableString(value.outcome),
+      awaiting: nullableString(value.awaiting),
+    };
+  });
+  const confidence = typeof o.confidence === "number" ? o.confidence : 0.35;
+
   return {
-    date,
-    doc_type,
-    stage_signal,
-    clinician: typeof o.clinician === "string" ? o.clinician : null,
-    actions_stated: asStrArray(o.actions_stated),
-    tests_ordered: asStrArray(o.tests_ordered),
-    drugs_mentioned: asStrArray(o.drugs_mentioned),
-    confidence,
+    letter_date: isISODate(o.letter_date) ? o.letter_date : null,
+    department: nullableString(o.department),
+    clinicians,
+    investigations,
+    findings,
+    referrals,
+    dependencies,
+    mdt,
+    confidence: Math.max(0, Math.min(1, confidence)),
   };
 }
 
-/** Lightweight deterministic extraction for arbitrary text in mock mode. */
+/** Conservative offline fallback for arbitrary text. */
 function heuristicExtract(text: string): Extraction {
   const lower = text.toLowerCase();
-  const dateMatch = text.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
-  const pick = <T extends string>(map: [RegExp, T][], fallback: T): T => {
-    for (const [re, val] of map) if (re.test(lower)) return val;
-    return fallback;
+  const date = text.match(/\b(\d{4})-(\d{2})-(\d{2})\b/)?.[0] ?? null;
+  const department = /respiratory|pulmon/.test(lower)
+    ? "Respiratory"
+    : /gastro|ibd|biologic|jak inhibitor/.test(lower)
+      ? "Gastroenterology"
+      : null;
+  const investigations: Extraction["investigations"] = [];
+  const add = (name: string, type: InvestigationType, status: Extraction["investigations"][number]["status"]) => {
+    if (!investigations.some((item) => item.name.toLowerCase() === name.toLowerCase())) {
+      investigations.push({ id: slug(name), name, type, ordered_date: date, report_date: null, status });
+    }
   };
-  const stage_signal = pick<StageSignal>(
-    [
-      [/homecare|home care|home delivery/, "homecare"],
-      [/first dose|dosing|infusion booked|administered/, "dosing"],
-      [/funding|blueteq|ifr|panel|prior approval/, "funding"],
-      [/screening|igra|tb screen|pre-biologic|bloods/, "screening"],
-      [/referr/, "referral"],
-    ],
-    "unknown",
-  );
-  const doc_type = pick<DocType>(
-    [
-      [/referr/, "referral"],
-      [/funding|blueteq/, "funding"],
-      [/homecare|home delivery/, "homecare"],
-      [/result|igra|x-ray|blood test/, "test_result"],
-      [/clinic|reviewed|consultant/, "clinic_letter"],
-    ],
-    "other",
-  );
+  if (/x[- ]?ray|radiograph/.test(lower)) add("Chest X-ray", "xray", /report|result|finding/.test(lower) ? "reported" : "ordered");
+  if (/\bct\b|computed tomography/.test(lower)) add("CT chest", "ct", /report|result/.test(lower) ? "reported" : "ordered");
+  if (/bronchosc/.test(lower)) add("Bronchoscopy", "bronchoscopy", /report|result/.test(lower) ? "reported" : "ordered");
+  if (/blood|\bigra\b/.test(lower)) add("Screening bloods", "bloods", /complete|result/.test(lower) ? "done" : "ordered");
+  if (/consult|clearance/.test(lower)) add("Respiratory clearance", "consult", /completed|clear/.test(lower) ? "actioned" : "ordered");
   return normalize({
-    date: dateMatch ? dateMatch[0] : null,
-    doc_type,
-    stage_signal,
-    confidence: 0.55,
+    letter_date: date,
+    department,
+    investigations,
+    findings: [],
+    referrals: [],
+    dependencies: [],
+    mdt: [],
+    confidence: 0.45,
   });
 }
 
-/** Extract a single letter into strict JSON. Uses the LLM if a key is set. */
+/** Extract one letter. A marked sample runs through the live provider when a key exists. */
 export async function extractLetter(input: ExtractInput): Promise<Extraction> {
-  // Sample letters always resolve to their canned extraction (demo path).
-  if (input.sampleId) {
-    const sample = SAMPLE_LETTERS.find((s) => s.id === input.sampleId);
-    if (sample) return sample.extraction;
-  }
+  const sample = input.sampleId ? SAMPLE_LETTERS.find((item) => item.id === input.sampleId) : undefined;
+  if (sample && !sample.live) return sample.extraction;
 
   const client = getLLM();
-
-  // Mock mode: no key.
   if (!client || !hasLLMKey) {
+    if (sample) return sample.extraction;
     if (input.text) return heuristicExtract(input.text);
-    return normalize({ confidence: 0.3 });
+    return normalize({ confidence: 0.25 });
   }
 
-  // LLM mode.
   const userContent: Array<
     | { type: "text"; text: string }
     | { type: "image_url"; image_url: { url: string } }
   > = [];
-  if (input.text) {
-    userContent.push({ type: "text", text: input.text });
-  }
+  const text = input.text || sample?.text;
+  if (text) userContent.push({ type: "text", text });
   if (input.imageBase64) {
     userContent.push({
       type: "image_url",
-      image_url: {
-        url: `data:${input.imageMime || "image/png"};base64,${input.imageBase64}`,
-      },
+      image_url: { url: `data:${input.imageMime || "image/png"};base64,${input.imageBase64}` },
     });
   }
-  if (userContent.length === 0) return normalize({ confidence: 0.3 });
+  if (userContent.length === 0) return normalize({ confidence: 0.25 });
 
-  // Any provider/network error degrades to a safe low-confidence extraction (or
-  // the text heuristic) rather than failing the request — the demo never breaks.
   try {
     const completion = await client.chat.completions.create({
       model: LLM_MODEL,
@@ -167,11 +242,10 @@ export async function extractLetter(input: ExtractInput): Promise<Extraction> {
         { role: "user", content: userContent },
       ],
     });
-
-    const content = completion.choices[0]?.message?.content ?? "{}";
-    return normalize(parseJsonLoose(content));
+    return normalize(parseJsonLoose(completion.choices[0]?.message?.content ?? "{}"));
   } catch {
+    if (sample) return sample.extraction;
     if (input.text) return heuristicExtract(input.text);
-    return normalize({ confidence: 0.3 });
+    return normalize({ confidence: 0.25 });
   }
 }

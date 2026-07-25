@@ -5,13 +5,13 @@ const TARGETS: DraftTarget[] = ["advice_line", "pals", "clinician_summary"];
 
 /**
  * POST /api/draft — draft an administrative escalation.
- * Body: { state, vitals?, target, meta? } (see DraftInput).
+ * Body: { stall, vitals?, target, meta? } (see DraftInput).
  */
 export async function POST(req: NextRequest) {
   try {
     const body = (await req.json()) as Partial<DraftInput>;
-    if (!body.state) {
-      return NextResponse.json({ error: "state is required" }, { status: 400 });
+    if (!body.stall) {
+      return NextResponse.json({ error: "stall is required" }, { status: 400 });
     }
     if (!body.target || !TARGETS.includes(body.target)) {
       return NextResponse.json(
@@ -20,7 +20,7 @@ export async function POST(req: NextRequest) {
       );
     }
     const result = await draft({
-      state: body.state,
+      stall: body.stall,
       vitals: body.vitals ?? null,
       target: body.target,
       meta: body.meta,

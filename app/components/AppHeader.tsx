@@ -57,7 +57,7 @@ export default function AppHeader({
       </div>
       <div className="leading-tight">
         <div className="font-display text-[20px] font-semibold tracking-[-0.01em] text-ink">
-          Pathway Copilot
+          Critical Path
         </div>
         <div className="text-[12.5px] text-ink-3">
           {dragging
