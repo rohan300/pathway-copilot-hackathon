@@ -1,11 +1,20 @@
+import type { ReactNode } from "react";
 import type { GraphNode, NoStallReason, PathwayGraph, Stall } from "@/lib/pipeline/types";
 import {
   buildPathwayView,
+  buildTimeline,
+  describeSpan,
   formatDate,
+  formatDayMonth,
   isSettled,
   noStallHeadline,
+  timelineOrder,
+  timelineSpanLabel,
   NO_STALL_FALLBACK,
   type PathwayView,
+  type TimelineEntry,
+  type TimelineMonth,
+  type TimelineView,
 } from "@/lib/view";
 
 interface Props {
@@ -65,38 +74,38 @@ function Pathway({
   noStallReason: NoStallReason | null;
 }) {
   const view = buildPathwayView(graph, stall);
+  // Built once and shared, so the header's step count and the rail below it
+  // can never disagree about the order.
+  const timeline = buildTimeline(view, stall);
+  const ordered = timelineOrder(timeline);
   return (
     <>
-      <GoalHeader view={view} stalled={Boolean(stall)} />
+      <GoalHeader
+        view={view}
+        stalled={Boolean(stall)}
+        position={ordered.findIndex((entry) => entry.node.id === view.current?.id)}
+        total={ordered.length}
+      />
       {stall ? <StallCard stall={stall} /> : <NoStallCard reason={noStallReason} view={view} />}
-      {view.chain.length > 0 && (
-        <>
-          <p className="mb-3 mt-1 px-1 text-[12.5px] text-ink-2">
-            Each step below is joined from the dates and dependencies written in your letters.
-          </p>
-          <div className="flex flex-col gap-0">
-            {view.chain.map((node, index) => (
-              <div key={node.id}>
-                <NodeCard
-                  node={node}
-                  stall={node.id === stall?.stalledNode.id ? stall : null}
-                  isGoal={node.id === view.goal?.nodeId}
-                  step={index + 1}
-                />
-                {index < view.chain.length - 1 && <Connector label="then" />}
-              </div>
-            ))}
-          </div>
-        </>
-      )}
+      {view.chain.length > 0 && <Timeline timeline={timeline} />}
       <OtherItems nodes={view.others} />
     </>
   );
 }
 
 /** AC2 — what the pathway is working toward and where it currently sits. */
-function GoalHeader({ view, stalled }: { view: PathwayView; stalled: boolean }) {
-  const position = view.current ? view.chain.findIndex((node) => node.id === view.current?.id) : -1;
+function GoalHeader({
+  view,
+  stalled,
+  position,
+  total,
+}: {
+  view: PathwayView;
+  stalled: boolean;
+  /** Index of the current step in timeline order; -1 when it isn't on the rail. */
+  position: number;
+  total: number;
+}) {
   return (
     <div className="mb-4 rounded-2xl border border-line bg-card-mut p-4">
       <div className="text-[11px] font-bold uppercase tracking-[0.04em] text-sage">Working toward</div>
@@ -115,10 +124,10 @@ function GoalHeader({ view, stalled }: { view: PathwayView; stalled: boolean }) 
             <span className={`font-semibold ${stalled ? "text-clay" : "text-ink"}`}>
               {view.current.label}
             </span>
-            {position >= 0 && view.chain.length > 0 && (
+            {position >= 0 && total > 0 && (
               <span className="text-ink-3">
                 {" "}
-                · step {position + 1} of {view.chain.length}
+                · step {position + 1} of {total}
               </span>
             )}
           </>
@@ -179,66 +188,215 @@ function NoStallCard({ reason, view }: { reason: NoStallReason | null; view: Pat
   );
 }
 
-function NodeCard({
-  node,
-  stall = null,
-  compact = false,
-  isGoal = false,
-  step,
-}: {
-  node: GraphNode;
-  /** Set only on the stalled node; its timings are authoritative over the node's own. */
-  stall?: Stall | null;
-  compact?: boolean;
-  isGoal?: boolean;
-  step?: number;
-}) {
-  const stalled = stall !== null;
-  const settled = isSettled(node);
+// ---------------------------------------------------------------------------
+// GLD-17 — the chain against a real time axis.
+//
+// Three columns per row: a date gutter, an unbroken rail, and the card. Every
+// month between the first and last step gets a row even when nothing happened
+// in it, so a five-week wait reads as a five-week gap instead of collapsing
+// into the next card.
+// ---------------------------------------------------------------------------
+
+function Timeline({ timeline }: { timeline: TimelineView }) {
+  const span = timelineSpanLabel(timeline);
   return (
-    <div
-      className={`rounded-2xl border ${compact ? "p-3" : "p-4"} ${
-        stalled ? "border-clay bg-card shadow-lift" : "border-line bg-card shadow-soft"
-      }`}
-    >
-      <div className="flex items-start gap-3">
+    <>
+      <div className="mb-1 mt-1 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 px-1">
+        <p className="text-[12.5px] text-ink-2">Your pathway in order, dated from your letters.</p>
+        {span && <span className="flex-none text-[11.5px] font-semibold text-ink-3">{span}</span>}
+      </div>
+      <div className="flex flex-col">
+        {timeline.months.map((month) => (
+          <MonthBlock key={month.key} month={month} />
+        ))}
+        {timeline.undated.length > 0 && <UndatedBlock entries={timeline.undated} />}
+        {timeline.destination && <DestinationRow entry={timeline.destination} />}
+      </div>
+    </>
+  );
+}
+
+function MonthBlock({ month }: { month: TimelineMonth }) {
+  return (
+    <div>
+      <RailRow gutter={null}>
+        <div className="flex items-center gap-2.5 pb-1 pt-3">
+          <span className="text-[10.5px] font-bold uppercase tracking-[0.06em] text-ink-3">
+            {month.label}
+          </span>
+          <span className="h-px flex-1 bg-line" />
+        </div>
+      </RailRow>
+      {month.entries.length === 0 ? (
+        <RailRow gutter={null}>
+          <div className="py-1.5 text-[11.5px] italic text-ink-3">nothing recorded</div>
+        </RailRow>
+      ) : (
+        month.entries.map((entry) => <TimelineRow key={entry.node.id} entry={entry} />)
+      )}
+    </div>
+  );
+}
+
+/** Steps the letters never dated — kept visible rather than dropped (AC6). */
+function UndatedBlock({ entries }: { entries: TimelineEntry[] }) {
+  return (
+    <div>
+      <RailRow gutter={null}>
+        <div className="flex items-center gap-2.5 pb-1 pt-3">
+          <span className="text-[10.5px] font-bold uppercase tracking-[0.06em] text-ink-3">
+            No date given
+          </span>
+          <span className="h-px flex-1 bg-line" />
+        </div>
+      </RailRow>
+      {entries.map((entry) => (
+        <TimelineRow key={entry.node.id} entry={entry} />
+      ))}
+    </div>
+  );
+}
+
+function TimelineRow({ entry }: { entry: TimelineEntry }) {
+  const tone = entry.overdue ? "overdue" : entry.settled ? "done" : "pending";
+  return (
+    <RailRow
+      dot={tone}
+      gutter={
         <span
-          className={`mt-0.5 grid h-6 w-6 flex-none place-items-center rounded-full text-[12px] font-bold ${
-            stalled ? "bg-clay text-white" : settled ? "bg-sage text-white" : "bg-line-2 text-ink-2"
+          className={`text-[11.5px] font-semibold tabular-nums ${
+            entry.overdue ? "text-clay" : entry.settled ? "text-ink-2" : "text-ink-3"
           }`}
         >
-          {stalled ? "!" : settled ? "✓" : step ? `${step}` : "·"}
+          {entry.date ? formatDayMonth(entry.date) : "—"}
         </span>
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className={`${compact ? "text-[13px]" : "text-[15px]"} font-semibold text-ink`}>{node.label}</span>
-            {stalled && <span className="rounded-full bg-clay px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.04em] text-white">Overdue</span>}
-            {isGoal && !stalled && (
-              <span className="rounded-full bg-sage-soft px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.04em] text-sage-deep">
-                Goal
-              </span>
-            )}
-          </div>
-          <div className="mt-1 text-[11.5px] text-ink-3">
-            {node.dept || "Department not identified"} · {node.kind}
-            {node.ordered_date ? ` · ordered ${formatDate(node.ordered_date)}` : ""}
-            {node.report_date ? ` · reported ${formatDate(node.report_date)}` : ""}
-          </div>
-          {/* AC3 — the stalled step carries its whole timing story inline, with
-              no interaction needed to see it. */}
-          {stall && (
-            <div className="mt-2 text-[12px] leading-relaxed text-clay-ink">
-              Waiting since {formatDate(stall.sinceDate ?? node.ordered_date)} · {stall.daysStalled} days ·{" "}
-              {stall.expectedDays === null
-                ? "no expected window defined"
-                : `expected within ${stall.expectedDays} days`}
-              {stall.owningDept ? ` · ${stall.owningDept}` : ""}
-            </div>
-          )}
-          {!compact && !stalled && node.status !== "unknown" && (
-            <div className="mt-2 text-[12px] text-ink-2">Status recorded as <span className="font-semibold text-ink">{node.status}</span>.</div>
-          )}
+      }
+    >
+      <div className="pb-2.5 pt-1.5">
+        <TimelineCard entry={entry} />
+      </div>
+    </RailRow>
+  );
+}
+
+/**
+ * AC4 — done, pending and overdue are told apart by the rail dot and the card's
+ * weight alone. Finished steps recede; the overdue one is the only lifted card.
+ */
+function TimelineCard({ entry }: { entry: TimelineEntry }) {
+  const { node, settled, overdue, isGoal, turnaroundDays } = entry;
+  return (
+    <div
+      className={`rounded-2xl border p-3.5 ${
+        overdue
+          ? "border-clay bg-card shadow-lift"
+          : settled
+            ? "border-line bg-card-mut"
+            : "border-line bg-card shadow-soft"
+      }`}
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={`text-[14.5px] font-semibold ${settled ? "text-ink-2" : "text-ink"}`}>
+          {node.label}
+        </span>
+        {overdue && (
+          <span className="rounded-full bg-clay px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.04em] text-white">
+            Overdue
+          </span>
+        )}
+        {isGoal && !overdue && (
+          <span className="rounded-full bg-sage-soft px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.04em] text-sage-deep">
+            Goal
+          </span>
+        )}
+      </div>
+      <div className="mt-0.5 text-[11.5px] text-ink-3">
+        {node.dept || "Department not identified"}
+        {node.status !== "unknown" ? ` · ${node.status}` : ""}
+      </div>
+      {overdue && (
+        <div className="mt-2 rounded-xl bg-clay-soft px-3 py-2 text-[12px] leading-relaxed text-clay-ink">
+          {overdue.phrase}
+          {overdue.detail ? ` · ${overdue.detail}` : ""}
         </div>
+      )}
+      {/* AC7 — a slow turnaround is worth seeing, in gold rather than clay, so
+          it never competes with the actual bottleneck. */}
+      {turnaroundDays !== null && (
+        <div className="mt-1.5 text-[11.5px] text-gold">
+          Took {describeSpan(turnaroundDays)} from request to result
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Where the pathway is heading — the end of the rail, not a step with holes in it. */
+function DestinationRow({ entry }: { entry: TimelineEntry }) {
+  return (
+    <div className="flex gap-3">
+      <div className="w-[54px] flex-none pt-5 text-right text-[10.5px] font-bold uppercase tracking-[0.05em] text-sage">
+        Goal
+      </div>
+      <div className="relative w-3 flex-none">
+        <span className="absolute left-1/2 top-0 h-[26px] w-px -translate-x-1/2 bg-line-2" />
+        <span className="absolute left-1/2 top-[20px] h-3.5 w-3.5 -translate-x-1/2 rounded-full border-2 border-sage bg-card ring-4 ring-canvas" />
+      </div>
+      <div className="min-w-0 flex-1 pb-2 pt-3">
+        <div className="rounded-2xl border border-sage-soft bg-sage-soft/50 p-3.5">
+          <div className="font-display text-[17px] font-semibold leading-tight text-ink">
+            {entry.node.label}
+          </div>
+          <div className="mt-1 text-[11.5px] text-ink-2">
+            {entry.node.dept || "Department not identified"} · not started yet
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** The three-column skeleton every timeline row shares, so the rail never jogs. */
+function RailRow({
+  gutter,
+  dot,
+  children,
+}: {
+  gutter: ReactNode;
+  dot?: "done" | "pending" | "overdue";
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex gap-3">
+      <div className="w-[54px] flex-none pt-3.5 text-right">{gutter}</div>
+      <div className="relative w-3 flex-none">
+        <span className="absolute left-1/2 top-0 h-full w-px -translate-x-1/2 bg-line-2" />
+        {dot && (
+          <span
+            className={`absolute left-1/2 top-[18px] h-3 w-3 -translate-x-1/2 rounded-full ring-4 ring-canvas ${
+              dot === "overdue"
+                ? "bg-clay"
+                : dot === "done"
+                  ? "bg-sage"
+                  : "border-2 border-line-2 bg-card"
+            }`}
+          />
+        )}
+      </div>
+      <div className="min-w-0 flex-1">{children}</div>
+    </div>
+  );
+}
+
+/** Off-chain items only — compact, and never carrying stall or goal treatment. */
+function NodeCard({ node }: { node: GraphNode }) {
+  return (
+    <div className="rounded-2xl border border-line bg-card p-3 shadow-soft">
+      <div className="text-[13px] font-semibold text-ink">{node.label}</div>
+      <div className="mt-1 text-[11.5px] text-ink-3">
+        {node.dept || "Department not identified"} · {node.kind}
+        {node.ordered_date ? ` · ordered ${formatDate(node.ordered_date)}` : ""}
+        {node.report_date ? ` · reported ${formatDate(node.report_date)}` : ""}
       </div>
     </div>
   );
@@ -255,15 +413,11 @@ function OtherItems({ nodes }: { nodes: GraphNode[] }) {
       </summary>
       <div className="flex flex-col gap-2 border-t border-line px-4 pb-4 pt-3">
         {nodes.map((node) => (
-          <NodeCard key={node.id} node={node} compact />
+          <NodeCard key={node.id} node={node} />
         ))}
       </div>
     </details>
   );
-}
-
-function Connector({ label }: { label: string }) {
-  return <div className="flex h-8 items-center gap-3 pl-3 text-[10px] font-bold uppercase tracking-[0.05em] text-ink-3"><span className="h-full border-l-2 border-dashed border-line-2" /><span>{label} ↓</span></div>;
 }
 
 function Metric({ label, value, accent = false }: { label: string; value: string; accent?: boolean }) {

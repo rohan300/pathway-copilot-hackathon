@@ -88,6 +88,217 @@ function nodeDate(node: GraphNode): string | null {
   return node.report_date ?? node.ordered_date;
 }
 
+// ---------------------------------------------------------------------------
+// Timeline — the chain laid out against a real time axis (GLD-17).
+// ---------------------------------------------------------------------------
+
+/**
+ * The one place a node's position on the rail is decided.
+ *
+ * A node sits at the date it actually happened, falling back to when it was
+ * requested. GLD-16 adds an authoritative `timelineDate` to GraphNode; when
+ * that lands this function reads it and the fallback below goes away. Nothing
+ * else in the UI picks a date for itself.
+ */
+function railDate(node: GraphNode): string | null {
+  return nodeDate(node);
+}
+
+/** True for an ISO date the browser can actually parse. Guards AC6 — a junk
+    date must degrade to "no date recorded", never render "Invalid Date". */
+function isDate(iso: string | null): iso is string {
+  return Boolean(iso) && !Number.isNaN(new Date(`${iso}T00:00:00`).getTime());
+}
+
+function daysApart(from: string, to: string): number | null {
+  const a = new Date(`${from}T00:00:00`).getTime();
+  const b = new Date(`${to}T00:00:00`).getTime();
+  if (Number.isNaN(a) || Number.isNaN(b)) return null;
+  return Math.round((b - a) / 86_400_000);
+}
+
+/** A duration in the words the letters themselves use — "5 weeks", not "34 days". */
+export function describeSpan(days: number): string {
+  const n = Math.abs(days);
+  if (n < 14) return `${n} day${n === 1 ? "" : "s"}`;
+  if (n < 60) return `${Math.round(n / 7)} weeks`;
+  const months = Math.round(n / 30.44);
+  return `${months} month${months === 1 ? "" : "s"}`;
+}
+
+/** e.g. "2026-03-13" -> "13 Mar". Gutter labels stay narrow. */
+export function formatDayMonth(iso: string): string {
+  const d = new Date(`${iso}T00:00:00`);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+}
+
+/**
+ * How overdue a step is, in plain words. Today this can only be built from the
+ * single `Stall` the API returns; GLD-16 adds per-node due dates and a stated
+ * `basis`, at which point each entry carries its own. Deliberately reports only
+ * what the API computed — a due date is never derived client-side.
+ */
+export interface TimelineOverdue {
+  /** Plain-words headline, e.g. "waiting 5 months". */
+  phrase: string;
+  /** Supporting clause, e.g. "expected within 28 days". Null when undefined. */
+  detail: string | null;
+}
+
+export interface TimelineEntry {
+  node: GraphNode;
+  /** Where it sits on the rail. Null for a step the letters never dated. */
+  date: string | null;
+  isGoal: boolean;
+  settled: boolean;
+  overdue: TimelineOverdue | null;
+  /**
+   * Request-to-report turnaround, when both dates are known and it's long
+   * enough to be worth naming. This is AC7's secondary delay — read off the two
+   * dates the node already carries, never flagged as the bottleneck.
+   */
+  turnaroundDays: number | null;
+}
+
+export interface TimelineMonth {
+  /** "2026-03" */
+  key: string;
+  /** "March 2026" */
+  label: string;
+  entries: TimelineEntry[];
+}
+
+export interface TimelineView {
+  /**
+   * Every month from the first dated step to the last — including months with
+   * nothing in them, so a five-week gap is visible as a gap rather than
+   * collapsing into the next card.
+   */
+  months: TimelineMonth[];
+  /** Dated steps, oldest first — the flat rail, for callers that don't want months. */
+  dated: TimelineEntry[];
+  /** Chain steps the letters never dated. Shown after the rail, never dropped. */
+  undated: TimelineEntry[];
+  /** The goal when it has no date of its own — the rail's destination marker. */
+  destination: TimelineEntry | null;
+}
+
+/** Past this many months the empty-month axis is more noise than signal. */
+const MAX_AXIS_MONTHS = 18;
+
+/** Three weeks — the point at which a turnaround is worth calling out. */
+const NOTABLE_TURNAROUND_DAYS = 21;
+
+/**
+ * Lay the pathway chain out chronologically (GLD-17 AC1).
+ *
+ * Off-chain nodes are not included — they stay demoted in their own group per
+ * GLD-13 AC4 / GLD-17 AC5. The goal is pulled out as a destination when it has
+ * no date, so an unstarted treatment reads as the end of the road rather than
+ * as a step with missing data.
+ */
+export function buildTimeline(view: PathwayView, stall: Stall | null): TimelineView {
+  const entries: TimelineEntry[] = view.chain.map((node) => {
+    const date = railDate(node);
+    const isStalled = node.id === stall?.stalledNode.id;
+    const turnaround =
+      node.ordered_date && node.report_date ? daysApart(node.ordered_date, node.report_date) : null;
+    return {
+      node,
+      date: isDate(date) ? date : null,
+      isGoal: node.id === view.goal?.nodeId,
+      settled: isSettled(node),
+      overdue: isStalled && stall ? overdueFromStall(stall) : null,
+      turnaroundDays:
+        turnaround !== null && turnaround >= NOTABLE_TURNAROUND_DAYS ? turnaround : null,
+    };
+  });
+
+  // The goal only becomes the destination marker when it is both undated and
+  // unfinished — a goal that already happened belongs on the rail at its date.
+  const destinationIndex = entries.findIndex((e) => e.isGoal && !e.date && !e.settled);
+  const destination = destinationIndex >= 0 ? entries[destinationIndex] : null;
+  const rest = entries.filter((_, i) => i !== destinationIndex);
+
+  const dated = rest
+    .filter((e): e is TimelineEntry & { date: string } => e.date !== null)
+    .sort((a, b) => a.date.localeCompare(b.date));
+  const undated = rest.filter((e) => e.date === null);
+
+  return { months: groupByMonth(dated), dated, undated, destination };
+}
+
+/** Every entry in the order the rail renders it — dated, then undated, then the goal. */
+export function timelineOrder(timeline: TimelineView): TimelineEntry[] {
+  return [...timeline.dated, ...timeline.undated, ...(timeline.destination ? [timeline.destination] : [])];
+}
+
+/** "12 Jan – 23 Jun 2026 · 5 months" — the whole arc in one line (AC1). */
+export function timelineSpanLabel(timeline: TimelineView): string | null {
+  if (timeline.dated.length === 0) return null;
+  const first = timeline.dated[0].date as string;
+  const last = timeline.dated[timeline.dated.length - 1].date as string;
+  const range = `${formatDayMonth(first)} – ${formatDate(last)}`;
+  const days = daysApart(first, last);
+  return days !== null && days >= 14 ? `${range} · ${describeSpan(days)}` : range;
+}
+
+function overdueFromStall(stall: Stall): TimelineOverdue {
+  return {
+    phrase: `waiting ${describeSpan(stall.daysStalled)}`,
+    detail: stall.expectedDays === null ? null : `expected within ${stall.expectedDays} days`,
+  };
+}
+
+function groupByMonth(dated: TimelineEntry[]): TimelineMonth[] {
+  if (dated.length === 0) return [];
+  const byKey = new Map<string, TimelineEntry[]>();
+  for (const entry of dated) {
+    const key = (entry.date as string).slice(0, 7);
+    const bucket = byKey.get(key);
+    if (bucket) bucket.push(entry);
+    else byKey.set(key, [entry]);
+  }
+
+  const keys = axisKeys(
+    (dated[0].date as string).slice(0, 7),
+    (dated[dated.length - 1].date as string).slice(0, 7),
+    byKey,
+  );
+  return keys.map((key) => ({ key, label: monthLabel(key), entries: byKey.get(key) ?? [] }));
+}
+
+/**
+ * Every month across the span, so quiet months render as visible gaps. Over
+ * MAX_AXIS_MONTHS the run of empty rows stops being informative, so only
+ * months that actually contain something are kept.
+ */
+function axisKeys(first: string, last: string, byKey: Map<string, unknown>): string[] {
+  const occupied = [...byKey.keys()].sort();
+  let [year, month] = first.split("-").map(Number);
+  const [lastYear, lastMonth] = last.split("-").map(Number);
+  if (!Number.isFinite(year) || !Number.isFinite(lastYear)) return occupied;
+
+  const keys: string[] = [];
+  while ((year < lastYear || (year === lastYear && month <= lastMonth)) && keys.length < MAX_AXIS_MONTHS) {
+    keys.push(`${year}-${String(month).padStart(2, "0")}`);
+    month += 1;
+    if (month > 12) {
+      month = 1;
+      year += 1;
+    }
+  }
+  // Ran past the cap — the span is too long for a full axis.
+  return keys.length >= MAX_AXIS_MONTHS ? occupied : keys;
+}
+
+function monthLabel(key: string): string {
+  const d = new Date(`${key}-01T00:00:00`);
+  if (Number.isNaN(d.getTime())) return key;
+  return d.toLocaleDateString("en-GB", { month: "long", year: "numeric" });
+}
+
 /**
  * Headline for the no-stall panel — never a bare node count. Codes are the
  * ones lib/pipeline/graph.ts `explainNoStall` actually emits; the reason's own
