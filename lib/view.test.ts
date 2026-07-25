@@ -45,6 +45,7 @@ function graph(over: Partial<PathwayGraph> = {}): PathwayGraph {
     ],
     goal: { nodeId: "funding", label: "Start filgotinib", dept: "Imperial Gastroenterology", source: "stated" },
     chainIds: ["referral", "clinic", "xray", "funding"],
+    statedDependencies: true,
     ...over,
   };
 }

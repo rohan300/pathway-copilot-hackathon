@@ -146,6 +146,30 @@ const BLOODS_CONCEPTS: Record<string, string> = {
   cholesterol: "biologicscreen",
 };
 
+/**
+ * Clinic shorthand written out in full, applied only when the shorthand is the
+ * WHOLE name of a step. "FU 4 weeks" in a plan line gives a step whose entire
+ * label is "FU", and a pathway that tells a patient "FU is 4 days overdue" has
+ * told them nothing. Expanding a fragment of a longer label is not attempted —
+ * that way lies rewriting a clinician's words.
+ */
+const LABEL_EXPANSIONS: Record<string, string> = {
+  fu: "Follow-up",
+  "f/u": "Follow-up",
+  cxr: "Chest X-ray",
+  lft: "Liver function tests",
+  lfts: "Liver function tests",
+  fbc: "Full blood count",
+  obs: "Observations",
+  mdt: "MDT discussion",
+};
+
+/** The name a step is shown under, with whole-label shorthand written out. */
+function displayLabel(name: string): string {
+  const expanded = LABEL_EXPANSIONS[name.trim().toLowerCase()];
+  return expanded ?? sentenceCase(name);
+}
+
 /** A modifier that marks a fresh instance of a step already carried out. */
 const REPEAT_MARKER = /\b(repeat|repeated|re-?do|further|another|interval|surveillance|second)\b/i;
 
@@ -225,6 +249,113 @@ function normalizeDept(dept: string | null): string | null {
   return trimmed || dept.trim() || null;
 }
 
+/**
+ * Specialties the letters name in more than one way — a respiratory clinic
+ * letterheaded "Pulmonology" is the same team as one letterheaded "Respiratory
+ * Medicine". Deliberately narrow: a sub-team like "TB team" is NOT folded into
+ * respiratory, because a letter from the wider service is not the answer the TB
+ * team specifically owes.
+ */
+const DEPT_SYNONYMS: Record<string, string> = {
+  pulmonology: "respiratory",
+  pulmonary: "respiratory",
+  gastroenterologist: "gastro",
+  gastroenterology: "gastro",
+};
+
+/** The words that say WHICH team a letter or referral belongs to. */
+function deptKey(dept: string | null): Set<string> {
+  const out = new Set<string>();
+  for (const raw of (dept || "").toLowerCase().split(/[^a-z0-9]+/)) {
+    if (!raw || STOPWORDS.has(raw) || ORG_TOKENS.has(raw)) continue;
+    const word = DEPT_SYNONYMS[raw] ?? raw;
+    if (word === "medicine" || word === "letter" || word === "consultant") continue;
+    out.add(word);
+  }
+  return out;
+}
+
+/** A step one letter promises, and what that letter says it is working toward. */
+interface PromisedStep {
+  node: GraphNode;
+  statedGoal: string | null;
+  letterDate: string | null;
+}
+
+/**
+ * Close the blockers the treating team has moved past.
+ *
+ * Letters restate what the goal is waiting on as a pathway progresses: on 2 Mar
+ * it is the screening bloods, by 23 Jun it is TB clearance. The team writing the
+ * later letter knows what they are still waiting for, so a step they have
+ * stopped naming is one the pathway got past — not one silently outstanding
+ * since March. Without this, every superseded loose end stays open forever and
+ * the OLDEST of them, being by then the most overdue, is reported as the
+ * bottleneck ahead of the thing the clinic is actually chasing.
+ *
+ * Deliberately narrow. Only steps the letters put directly in front of the goal
+ * are closed — named as blocking it, or promised by a letter working toward it —
+ * and only by a later letter that put something DIFFERENT in front of the same
+ * goal. A step nobody ever placed there is untouched, and whatever the most
+ * recent letter named is exactly what stays open.
+ */
+function closeSupersededBlockers(blockers: Array<{ node: GraphNode; letterDate: string | null }>) {
+  const latest = blockers.reduce<string | null>(
+    (newest, entry) => (entry.letterDate && (!newest || entry.letterDate > newest) ? entry.letterDate : newest),
+    null,
+  );
+  if (!latest) return;
+  const stillNamed = new Set(
+    blockers.filter((entry) => entry.letterDate === latest).map((entry) => entry.node.id),
+  );
+  for (const { node, letterDate } of blockers) {
+    if (stillNamed.has(node.id) || COMPLETED.has(node.status)) continue;
+    if (letterDate && letterDate < latest) node.status = "actioned";
+  }
+}
+
+/**
+ * Close the steps a later letter proves already happened.
+ *
+ * A referral is answered once the department it points at writes a letter of its
+ * own — otherwise every historic referral stays "ordered" forever and reports as
+ * the oldest bottleneck long after the clinic actually took place. A promised
+ * follow-up appointment closes on the same evidence, because a clinic letter IS
+ * what an appointment produces: a review promised on 12 May and followed by that
+ * team's letter on 23 June happened, a week early, and is not still owed. Without
+ * this a pathway accumulates every review it has ever had and chases the oldest.
+ *
+ * A clearance is deliberately exempt. It is a decision another team owes back in
+ * writing, and the fact that they wrote *a* letter is not the fact that they gave
+ * it — inferring otherwise closes the very thing the pathway is waiting on.
+ */
+function closeFulfilledAppointments(
+  nodes: GraphNode[],
+  ordered: Extraction[],
+  dependencyText: Set<string>,
+) {
+  for (const node of nodes) {
+    const appointment =
+      node.kind === "referral" || (node.kind === "investigation" && node.invType === "consult");
+    if (!appointment || !node.dept || COMPLETED.has(node.status)) continue;
+    if (/\bclear(ance|ed)?\b/i.test(node.label)) continue;
+    // A step a letter explicitly says something is awaiting stays open until a
+    // letter says otherwise — the words beat the inference.
+    const label = compact(node.label);
+    if ([...dependencyText].some((text) => text.includes(label) || label.includes(text))) continue;
+    const promised = startDate(node);
+    const target = deptKey(node.dept);
+    if (!target.size || !promised) continue;
+    const answered = ordered.some((extraction) => {
+      const from = deptKey(extraction.department);
+      if (![...from].some((token) => target.has(token))) return false;
+      // Strictly later: the letter that made the promise cannot also keep it.
+      return Boolean(extraction.letter_date && extraction.letter_date > promised);
+    });
+    if (answered) node.status = "actioned";
+  }
+}
+
 function expectedDays(kind: GraphNodeKind, invType: GraphNode["invType"]): number | null {
   const value = EXPECTED_MAX_DAYS[invType || kind];
   return typeof value === "number" ? value : null;
@@ -267,11 +398,10 @@ function addEdge(
   from: GraphNode | undefined,
   to: GraphNode | undefined,
   kind: EdgeKind,
-  inferred = false,
 ) {
   if (!from || !to || from.id === to.id) return;
   if (!edges.some((edge) => edge.from === from.id && edge.to === to.id && edge.kind === kind)) {
-    edges.push(inferred ? { from: from.id, to: to.id, kind, inferred: true } : { from: from.id, to: to.id, kind });
+    edges.push({ from: from.id, to: to.id, kind });
   }
 }
 
@@ -281,7 +411,11 @@ function addEdge(
  * loosely, so this widens in three passes and stops at the first hit: the exact
  * normalized label, a containment match, then the identifying tokens.
  */
-function findNode(nodes: GraphNode[], text: string | null | undefined): GraphNode | undefined {
+function findNode(
+  nodes: GraphNode[],
+  text: string | null | undefined,
+  options: { preferOpen?: boolean } = {},
+): GraphNode | undefined {
   if (!text) return undefined;
   // Extractor ids carry a "-N" uniqueness suffix that the prose reference does not.
   const cleaned = text.replace(/-\d+$/, "");
@@ -292,13 +426,80 @@ function findNode(nodes: GraphNode[], text: string | null | undefined): GraphNod
   // Both sides must be long enough for a substring hit to mean anything: "FU"
   // is inside "Liver FUnction Tests", and matching those would hang a clinic's
   // promised follow-up date on a blood test.
-  const contained = nodes.find((node) => {
-    const label = compact(node.label);
-    return label.length > 3 && wanted.length > 3 && (label.includes(wanted) || wanted.includes(label));
-  });
-  if (contained) return contained;
+  //
+  // Containment stops being an answer the moment two nodes contain the phrase.
+  // "filgotinib" sits inside "Start filgotinib" and equally inside a referral
+  // reason that recounts the whole case, and taking whichever came first hung
+  // the goal's own dependencies off a paragraph of background. The label closest
+  // in length to the phrase is the one that names this step and little else, so
+  // that is the one the reference meant.
+  const contained = nodes
+    .filter((node) => {
+      const label = compact(node.label);
+      return label.length > 3 && wanted.length > 3 && (label.includes(wanted) || wanted.includes(label));
+    })
+    .sort(
+      (a, b) =>
+        Math.abs(compact(a.label).length - wanted.length) - Math.abs(compact(b.label).length - wanted.length),
+    );
+  if (contained.length) return contained[0];
+
+  // Last pass: the words that say WHICH step this is. Demanding the two sets
+  // match exactly meant "repeat CT scan of his chest" found neither the CT chest
+  // already on the graph nor anything else, and a dependency the letters wrote
+  // down was silently dropped. So the sets only have to agree — one covering the
+  // other, or a clear majority in common — and the closest fit wins, which keeps
+  // a partial overlap like "clearance" from attaching itself to any clearance in
+  // the file when a better-matching one exists.
   const key = intentKey(cleaned);
-  return key ? nodes.find((node) => intentKey(node.label) === key) : undefined;
+  if (!key) return undefined;
+  const wantedTokens = new Set(key.split(" ").filter(Boolean));
+  const scored = nodes
+    .map((node) => {
+      const tokens = new Set(intentKey(node.label).split(" ").filter(Boolean));
+      if (!tokens.size) return null;
+      const shared = [...wantedTokens].filter((token) => tokens.has(token)).length;
+      if (!shared) return null;
+      const union = new Set([...wantedTokens, ...tokens]).size;
+      const agrees = shared === wantedTokens.size || shared === tokens.size || shared / union >= 0.5;
+      return agrees ? { node, shared, union } : null;
+    })
+    .filter((entry): entry is { node: GraphNode; shared: number; union: number } => entry !== null)
+    .sort((a, b) => {
+      // A reference to something being waited on means the step still open, not
+      // the one already carried out under a similar name.
+      if (options.preferOpen) {
+        const openA = Number(!COMPLETED.has(a.node.status));
+        const openB = Number(!COMPLETED.has(b.node.status));
+        if (openA !== openB) return openB - openA;
+      }
+      return b.shared - a.shared || a.union - b.union;
+    });
+  return scored[0]?.node;
+}
+
+/**
+ * The steps a phrase names, allowing for a letter naming two of them in one
+ * breath: "repeat CT scan of his chest and TB culture negative at six weeks" is
+ * two things being waited on, not one step with a long name.
+ *
+ * Splitting is only ever used to RESOLVE a reference against steps that already
+ * exist — no half of a phrase becomes a node of its own — so a phrase whose
+ * halves name nothing behaves exactly as it did before.
+ */
+function findNodes(
+  nodes: GraphNode[],
+  text: string | null | undefined,
+  options: { preferOpen?: boolean } = {},
+): GraphNode[] {
+  if (!text) return [];
+  const parts = text.split(/\s+\band\b\s+/i).map((part) => part.trim()).filter(Boolean);
+  const found: GraphNode[] = [];
+  for (const part of parts.length > 1 ? parts : [text]) {
+    const node = findNode(nodes, part, options);
+    if (node && !found.includes(node)) found.push(node);
+  }
+  return found;
 }
 
 /** Letters sorted oldest-first; undated letters keep their upload order at the front. */
@@ -417,36 +618,32 @@ function outgoing(graph: PathwayGraph, id: string): GraphEdge[] {
 }
 
 /**
- * The best route from `start` to the goal, preferring routes the letters
- * actually state over ones we inferred from dates alone. Cost is the number of
- * inferred edges, then the number of hops — so "the letters say this blocks the
- * treatment" always beats "this merely happened before it".
+ * The shortest route from `start` to the goal along the dependencies the
+ * letters actually state.
+ *
+ * Every edge here is stated, so there is nothing to weigh: chronological
+ * adjacency is deliberately NOT an edge. A chest X-ray happening before a CT
+ * does not mean the CT was waiting on it, and inferring that — especially
+ * across departments — invents a clinical causation no letter wrote down. The
+ * timeline gets its order from `timelineDate`; the graph only ever says a step
+ * blocks another when a letter said so.
  */
-function bestPath(graph: PathwayGraph, start: GraphNode): { path: GraphNode[]; inferred: number } | null {
+function bestPath(graph: PathwayGraph, start: GraphNode): { path: GraphNode[] } | null {
   const byId = new Map(graph.nodes.map((node) => [node.id, node]));
-  const best = new Map<string, number>([[start.id, 0]]);
-  const queue: Array<{ id: string; path: GraphNode[]; inferred: number }> = [
-    { id: start.id, path: [start], inferred: 0 },
-  ];
-  let found: { path: GraphNode[]; inferred: number } | null = null;
+  const seen = new Set<string>([start.id]);
+  const queue: GraphNode[][] = [[start]];
   while (queue.length) {
-    queue.sort((a, b) => (a.inferred - b.inferred) || (a.path.length - b.path.length));
-    const current = queue.shift()!;
-    if (found && current.inferred >= found.inferred) break;
-    if (current.id === graph.goal.nodeId) {
-      found = { path: current.path, inferred: current.inferred };
-      continue;
-    }
+    const path = queue.shift()!;
+    const current = path[path.length - 1];
+    if (current.id === graph.goal.nodeId) return { path };
     for (const edge of outgoing(graph, current.id)) {
       const next = byId.get(edge.to);
-      if (!next) continue;
-      const cost = current.inferred + (edge.inferred ? 1 : 0);
-      if ((best.get(next.id) ?? Infinity) <= cost) continue;
-      best.set(next.id, cost);
-      queue.push({ id: next.id, path: [...current.path, next], inferred: cost });
+      if (!next || seen.has(next.id)) continue;
+      seen.add(next.id);
+      queue.push([...path, next]);
     }
   }
-  return found;
+  return null;
 }
 
 function pathToGoal(graph: PathwayGraph, start: GraphNode): GraphNode[] | null {
@@ -469,7 +666,11 @@ export function buildGraph(extractions: Extraction[], asOf = todayISO()): Pathwa
     /** The naming letter's own investigation ids — an exact reference beats a fuzzy one. */
     local: Map<string, GraphNode>;
   }> = [];
-  const sourceDependencies: Extraction["dependencies"] = [];
+  const sourceDependencies: Array<{
+    dependency: Extraction["dependencies"][number];
+    letterDate: string | null;
+    dept: string | null;
+  }> = [];
   const sourceMdts: Array<{ date: string | null; outcome: string | null; awaiting: string | null }> = [];
   /** Every node a given letter contributed, for the date-ordered fallback. */
   const dependencyText = new Set(
@@ -481,7 +682,7 @@ export function buildGraph(extractions: Extraction[], asOf = todayISO()): Pathwa
   /** Identifying tokens per node, so the same step is recognised across letters. */
   const tokensById = new Map<string, Set<string>>();
   /** Follow-ups deferred until every step exists to attach them to. */
-  const sourceFollowUps: Array<{ followUp: NonNullable<Extraction["follow_ups"]>[number]; letterDate: string | null; dept: string | null }> = [];
+  const sourceFollowUps: SourceFollowUp[] = [];
 
   for (const extraction of ordered) {
     /**
@@ -601,9 +802,17 @@ export function buildGraph(extractions: Extraction[], asOf = todayISO()): Pathwa
     }
 
     for (const referral of extraction.referrals) {
-      const label = /clearance/i.test(referral.reason || "")
-        ? `${referral.to_dept || "Department"} clearance`
-        : referral.reason || `${referral.to_dept || "Department"} referral`;
+      // A referral is the act of asking another team to take this on, and that
+      // is what it is named for. The reason a letter gives is often a paragraph
+      // of case history — real prose, but not the name of a step, and making a
+      // node out of each one is what buried the pathway under restated
+      // background ("needs to be under the care of an NHS clinic moving
+      // forwards" is not something anyone can chase). The one reason that IS a
+      // step is a clearance, because that is a decision the other team owes back.
+      const team = referral.to_dept || referral.from_dept || "Department";
+      const label = /\bclear(ance|ed)?\b/i.test(referral.reason || "")
+        ? `${team} clearance`
+        : `${team} referral`;
       const key = stepTokens(label, null);
       const existing = nodes.find((node) =>
         node.kind === "referral" && sameStep(tokensById.get(node.id)!, key, true),
@@ -628,29 +837,17 @@ export function buildGraph(extractions: Extraction[], asOf = todayISO()): Pathwa
     for (const mdt of extraction.mdt) {
       sourceMdts.push({ date: mdt.date, outcome: mdt.outcome, awaiting: mdt.awaiting });
     }
-    sourceDependencies.push(...extraction.dependencies);
-    for (const followUp of extraction.follow_ups ?? []) {
-      sourceFollowUps.push({ followUp, letterDate: extraction.letter_date, dept: extraction.department });
+    for (const dependency of extraction.dependencies) {
+      sourceDependencies.push({ dependency, letterDate: extraction.letter_date, dept: extraction.department });
     }
-  }
-
-  // A referral is answered once the department it points at writes a later
-  // letter — otherwise every historic referral stays "ordered" forever and
-  // reports as the oldest bottleneck long after the clinic actually happened.
-  for (const node of nodes) {
-    if (node.kind !== "referral" || !node.dept) continue;
-    // A referral a letter explicitly says something is awaiting stays open
-    // until a letter says otherwise — the words beat the inference.
-    const label = compact(node.label);
-    if ([...dependencyText].some((text) => text.includes(label) || label.includes(text))) continue;
-    const sent = startDate(node);
-    const answered = ordered.some((extraction) => {
-      const dept = compact(extraction.department || "");
-      const target = compact(node.dept!);
-      if (!dept || !target || !(dept.includes(target) || target.includes(dept))) return false;
-      return Boolean(extraction.letter_date && sent && extraction.letter_date >= sent);
-    });
-    if (answered) node.status = "actioned";
+    for (const followUp of extraction.follow_ups ?? []) {
+      sourceFollowUps.push({
+        followUp,
+        letterDate: extraction.letter_date,
+        dept: extraction.department,
+        statedGoal: extraction.stated_goal ?? null,
+      });
+    }
   }
 
   // The goal is derived from the letters; reuse a node that already carries the
@@ -687,11 +884,56 @@ export function buildGraph(extractions: Extraction[], asOf = todayISO()): Pathwa
 
   // Explicit “awaiting X before Y” relationships are stated dependency edges;
   // the LLM does not invent these joins.
-  for (const dependency of sourceDependencies) {
-    const blocked = findNode(nodes, dependency.blocked_item);
-    const blocking = findNode(nodes, dependency.blocking_item);
+  /** Steps a letter names as blocking the goal, with the date it said so. */
+  const statedGoalBlockers: Array<{ node: GraphNode; letterDate: string | null }> = [];
+  for (const { dependency, letterDate, dept } of sourceDependencies) {
+    let blocked = findNodes(nodes, dependency.blocked_item, { preferOpen: true });
+    // A letter saying other steps are waited on BEFORE this one happens is the
+    // letter telling us this is a step. "Clear him for his UC treatment" is a
+    // decision the respiratory team owes, and it exists on the pathway whether
+    // or not any other sentence in the file happened to name it as an
+    // investigation or a referral. Only the blocked side earns a node this way:
+    // it is a destination the letters commit to, where an unresolved BLOCKING
+    // phrase is usually background prose about why.
+    if (!blocked.length) {
+      const node = makeNode({
+        id: `approval:${slug(dependency.blocked_item)}-${nodes.length + 1}`,
+        label: sentenceCase(dependency.blocked_item),
+        dept,
+        kind: "approval",
+        status: "awaiting",
+        ordered_date: letterDate,
+        dateSource: "letter",
+      });
+      nodes.push(node);
+      blocked = [node];
+    }
+    const blocking = findNodes(nodes, dependency.blocking_item, { preferOpen: true });
     const kind: EdgeKind = /await/i.test(dependency.stated_status || "") ? "awaiting" : "blocks";
-    addEdge(edges, blocking, blocked, kind);
+    for (const from of blocking) {
+      for (const to of blocked) {
+        addEdge(edges, from, to, kind);
+        if (to.id === goalNode.id) statedGoalBlockers.push({ node: from, letterDate });
+      }
+    }
+  }
+
+
+  // Letters written by different teams name different destinations, and only one
+  // of them can be the goal. The others are not wrong — they are what that team
+  // is working toward on the way there. The respiratory team's "clear him for
+  // his UC treatment" IS a step toward the gastro team's filgotinib, and saying
+  // so is the letters' own claim, not a judgement of ours about which team
+  // matters. Without it a cross-department pathway splits into two disconnected
+  // halves, and the half holding everything up is the one that never reaches the
+  // goal — so nothing can be reported as blocking anything.
+  //
+  // Runs after the dependency pass, because that is where a destination no other
+  // sentence names becomes a node.
+  for (const extraction of ordered) {
+    const stated = extraction.stated_goal?.trim();
+    if (!stated || intentKey(stated) === intentKey(goalNode.label)) continue;
+    addEdge(edges, findNode(nodes, stated, { preferOpen: true }), goalNode, "blocks");
   }
 
   // MDT awaiting fields are also explicit joins when present. Reuse an
@@ -702,10 +944,37 @@ export function buildGraph(extractions: Extraction[], asOf = todayISO()): Pathwa
     if (awaiting && outcome) addEdge(edges, awaiting, outcome, "awaiting");
   }
 
-  const dueBasis = applyFollowUps(nodes, sourceFollowUps, tokensById);
+  const { dueBasis, promised } = applyFollowUps(nodes, sourceFollowUps, tokensById);
 
-  const graph: PathwayGraph = { nodes, edges, goal, chainIds: [] };
-  connectTimeline(graph);
+  // A follow-up is promised BY a letter that says, in the same breath, what it is
+  // working toward — "FU 4 weeks" in the TB clinic's letter is a step toward
+  // clearing him, and the repeat CT the respiratory team asked for is a step
+  // toward starting filgotinib. Both halves are the letter's own words, so
+  // joining them claims nothing extra; without the join the step a clinic
+  // promised and never delivered floats off the pathway and cannot be reported
+  // as holding anything up, which is exactly the item most worth chasing.
+  for (const { node, statedGoal, letterDate } of promised) {
+    const toward = (statedGoal && findNode(nodes, statedGoal, { preferOpen: true })) || goalNode;
+    addEdge(edges, node, toward, "blocks");
+    if (toward.id === goalNode.id) statedGoalBlockers.push({ node, letterDate });
+  }
+
+  closeSupersededBlockers(statedGoalBlockers);
+
+  // After the promised appointments exist, so a review the letters commit to is
+  // closed by the same evidence that closes a referral.
+  closeFulfilledAppointments(nodes, ordered, dependencyText);
+
+  const graph: PathwayGraph = {
+    nodes,
+    edges,
+    goal,
+    chainIds: [],
+    // What the LETTERS state, not what survived edge resolution: a dependency
+    // naming a step we never turned into a node still means these letters are
+    // the kind that write dependencies down.
+    statedDependencies: sourceDependencies.length > 0 || sourceMdts.some((mdt) => Boolean(mdt.awaiting)),
+  };
   graph.chainIds = chainIds(graph);
   finalize(graph, dueBasis, asOf);
   return graph;
@@ -733,13 +1002,19 @@ function finalize(graph: PathwayGraph, dueBasis: Map<string, string>, asOf: stri
  */
 function overdueBasis(node: GraphNode, dueBasis: Map<string, string>, asOf: string): string {
   const stated = dueBasis.get(node.id);
-  if (node.dueDate && stated) {
-    return `Due ${humanDate(node.dueDate)} — ${stated} — and still outstanding on ${humanDate(asOf)}.`;
-  }
-  const since = startDate(node);
-  return since && node.expected_days !== null
-    ? `Open since ${humanDate(since)} — ${daysBetween(since, asOf)} days against an expected ${node.expected_days}. No letter promises a date for it.`
-    : `Outstanding on ${humanDate(asOf)}.`;
+  const due = node.dueDate ? humanDate(node.dueDate) : humanDate(asOf);
+  return stated
+    ? `Due ${due} — ${stated} — and still outstanding on ${humanDate(asOf)}.`
+    : `Due ${due} and still outstanding on ${humanDate(asOf)}.`;
+}
+
+/** A wait one letter promises, with the context of the letter that promised it. */
+interface SourceFollowUp {
+  followUp: NonNullable<Extraction["follow_ups"]>[number];
+  letterDate: string | null;
+  dept: string | null;
+  /** What that letter says it is working toward, so the promise joins the pathway. */
+  statedGoal: string | null;
 }
 
 /**
@@ -756,12 +1031,20 @@ function overdueBasis(node: GraphNode, dueBasis: Map<string, string>, asOf: stri
  */
 function applyFollowUps(
   nodes: GraphNode[],
-  followUps: Array<{ followUp: NonNullable<Extraction["follow_ups"]>[number]; letterDate: string | null; dept: string | null }>,
+  followUps: SourceFollowUp[],
   tokensById: Map<string, Set<string>>,
-): Map<string, string> {
+): { dueBasis: Map<string, string>; promised: PromisedStep[] } {
   /** node id -> the letter's own words for how its due date was arrived at. */
   const dueBasis = new Map<string, string>();
-  for (const { followUp, letterDate, dept } of followUps) {
+  /** Each promised step with what the letter promising it was working toward. */
+  const promised: PromisedStep[] = [];
+  for (const { followUp, letterDate, dept, statedGoal } of followUps) {
+    // "budesonide 9 mg daily FOR THE NEXT 8 weeks" says how long a course runs,
+    // not when anything is owed back. A duration is not a deadline, and reading
+    // one as a deadline puts a breach on the record that no clinic ever
+    // promised — the course finishing is the treatment working, not a step
+    // nobody booked.
+    if (followUp.phrase && /^\s*for\b/i.test(followUp.phrase)) continue;
     const anchorNode = followUp.from ? findNode(nodes, followUp.from) : undefined;
     const anchor = (anchorNode && timelineOf(anchorNode)) || letterDate;
     const due = followUp.due_date ?? (anchor && followUp.phrase ? dueDateFrom(anchor, followUp.phrase) : null);
@@ -771,20 +1054,24 @@ function applyFollowUps(
       ? `stated as due ${humanDate(followUp.due_date)}`
       : `"${followUp.phrase}" from ${anchorNode ? `${anchorNode.label} on ` : ""}${humanDate(anchor)}`;
 
-    let target = findNode(nodes, followUp.item);
-    if (target && COMPLETED.has(target.status)) {
-      // The letters promise the NEXT one; the completed step keeps its own dates.
-      target = undefined;
-    }
-    if (!target) {
-      const label = sentenceCase(followUp.item);
+    // A letter promises two things in one line as readily as one — "chest x-ray
+    // and cholesterol and lipid profile next week" is three steps already on the
+    // pathway, and treating the sentence as a single unnamed step invented a
+    // fourth that nobody ordered and then reported it as months late.
+    const named = findNodes(nodes, followUp.item, { preferOpen: true });
+    // The letters promise the NEXT one; a step already carried out keeps its own
+    // dates. When every step the line names is done, the promise is kept — there
+    // is nothing left to be due.
+    let targets = named.filter((node) => !COMPLETED.has(node.status));
+    if (!named.length) {
+      const label = displayLabel(followUp.item);
       // A promised item is filed under the type its NAME implies, not assumed to
       // be an appointment: "repeat non-contrast CT" is the CT already on the
       // graph waiting to be done, and giving it a due date of its own as a
       // separate consult would show the same scan twice.
       const invType = typeFromName(followUp.item);
       const key = stepTokens(label, invType);
-      target = nodes.find((node) =>
+      let target = nodes.find((node) =>
         node.kind === "investigation" && node.invType === invType &&
         !COMPLETED.has(node.status) && sameStep(tokensById.get(node.id) ?? new Set(), key),
       );
@@ -802,56 +1089,45 @@ function applyFollowUps(
         nodes.push(target);
         tokensById.set(target.id, key);
       }
+      targets = [target];
     }
-    // Earliest promise wins: the first date it was due is the date it is late from.
-    if (!target.dueDate || due < target.dueDate) {
-      target.dueDate = due;
-      dueBasis.set(target.id, basis);
+    for (const target of targets) {
+      promised.push({ node: target, statedGoal, letterDate });
+      // Earliest promise wins: the first date it was due is the date it is late from.
+      if (!target.dueDate || due < target.dueDate) {
+        target.dueDate = due;
+        dueBasis.set(target.id, basis);
+      }
     }
   }
-  return dueBasis;
-}
-
-/** The dated pathway steps, oldest first, by the date they belong on a timeline. */
-function timelineSpine(graph: PathwayGraph): GraphNode[] {
-  return graph.nodes
-    .filter((node) => node.id !== graph.goal.nodeId && node.kind !== "finding" && timelineOf(node) !== null)
-    .map((node, index) => ({ node, index }))
-    .sort((a, b) => {
-      const left = timelineOf(a.node)!;
-      const right = timelineOf(b.node)!;
-      return left === right ? a.index - b.index : left < right ? -1 : 1;
-    })
-    .map((item) => item.node);
+  return { dueBasis, promised };
 }
 
 /**
- * Real letters rarely write "awaiting X before Y", so stated dependencies alone
- * leave most steps unconnected and nothing reaches the goal. Every dated step
- * that cannot get to the goal on the letters' own words is therefore linked
- * forward to the next step in date order, which makes the pathway one ordered
- * timeline ending at the goal.
+ * Whether any letter states what the goal is waiting on.
  *
- * These edges are marked `inferred` and are worth strictly less than a stated
- * one everywhere it matters: they order the timeline, they never decide what is
- * blocking the treatment. Order comes from the written dates, never the model.
+ * Real letters often write a whole pathway without ever putting "X before Y" on
+ * paper. When that happens there is nothing to demote against: calling a step
+ * off-pathway would be our judgement, not the letters'. So this decides whether
+ * the graph is entitled to demote anything at all, and whether a late step can
+ * be named as the blocker without a stated route to prove it.
  */
-function connectTimeline(graph: PathwayGraph) {
-  const spine = timelineSpine(graph);
-  const goalNode = graph.nodes.find((node) => node.id === graph.goal.nodeId);
-  if (!spine.length || !goalNode) return;
-
-  // Latest first, so each step is linked to a successor that already connects.
-  for (let i = spine.length - 1; i >= 0; i--) {
-    if (pathToGoal(graph, spine[i]) !== null) continue;
-    addEdge(graph.edges, spine[i], i === spine.length - 1 ? goalNode : spine[i + 1], "blocks", true);
-  }
+function goalHasStatedRoute(graph: PathwayGraph): boolean {
+  return graph.statedDependencies;
 }
 
-/** Nodes that actually reach the goal, in date order, ending at the goal. */
+/**
+ * Nodes that actually reach the goal, in date order, ending at the goal.
+ *
+ * With no stated dependency anywhere, every step stays on the chain — see
+ * `goalHasStatedRoute`. Findings are evidence hanging off a step and are never
+ * chain members in their own right.
+ */
 function chainIds(graph: PathwayGraph): string[] {
+  const stated = goalHasStatedRoute(graph);
   const onChain = graph.nodes
-    .filter((node) => node.id !== graph.goal.nodeId && pathToGoal(graph, node) !== null)
+    .filter((node) => node.id !== graph.goal.nodeId)
+    .filter((node) => (stated ? pathToGoal(graph, node) !== null : node.kind !== "finding"))
     .map((node, index) => ({ node, index }))
     .sort((a, b) => {
       const left = timelineOf(a.node) || "9999-12-31";
@@ -863,17 +1139,19 @@ function chainIds(graph: PathwayGraph): string[] {
 }
 
 /**
- * Whether an open step is late, and by how much. A date the letters promise
- * beats the generic per-type expected wait: "FU 4 weeks" is what the clinic
- * actually committed to, and it is the number the patient can hold them to.
+ * Whether an open step is late, and by how much.
+ *
+ * Only a date the letters actually promised makes a step overdue. The generic
+ * per-type expected wait says what is typical, and typical is not a commitment:
+ * calling a step late because it passed an average we invented puts a number on
+ * a clinical timeline that nobody in the letters ever agreed to. "FU 4 weeks" is
+ * what the clinic committed to, and it is the only kind of number the patient
+ * can hold them to. No stated interval, no flag.
  */
 function overdueBy(node: GraphNode, asOf: string): number | null {
   if (COMPLETED.has(node.status)) return null;
-  if (node.dueDate) return asOf > node.dueDate ? daysBetween(node.dueDate, asOf) : null;
-  const since = startDate(node);
-  if (since === null || node.expected_days === null) return null;
-  const waited = daysBetween(since, asOf);
-  return waited > node.expected_days ? waited - node.expected_days : null;
+  if (!node.dueDate) return null;
+  return asOf > node.dueDate ? daysBetween(node.dueDate, asOf) : null;
 }
 
 /** Every open step now past its due date, most overdue first. */
@@ -889,39 +1167,31 @@ function overdueNodes(graph: PathwayGraph, asOf: string): GraphNode[] {
  * is hidden — it is just not called THE blocker, which by definition there is
  * one of.
  *
- * Ranking, in order: the upstream root first (a late step that is itself
- * waiting on another late step is not the one to chase — chasing the clearance
- * achieves nothing while the scan it needs is unbooked), then the longest
- * overdue, then the earliest promised date. All three come from the graph, not
- * from any letter-specific rule.
+ * Ranking is the longest overdue first, then the earliest promised date. The
+ * worst breach of a promise the clinic actually made is the thing to chase, and
+ * both numbers come from dates the letters wrote down rather than from any
+ * judgement of ours about which department matters more.
  */
 export function findStall(graph: PathwayGraph, asOf = todayISO()): Stall | null {
   const overdue = overdueNodes(graph, asOf);
+  const goalNode = graph.nodes.find((node) => node.id === graph.goal.nodeId);
+  if (!goalNode) return null;
+  // With no stated dependency anywhere, nothing can prove a route to the goal —
+  // and nothing contradicts one either. The late step is then reported as
+  // blocking the goal directly, which claims no more than the letters support.
+  const stated = goalHasStatedRoute(graph);
   const candidates = overdue
-    .map((node) => ({ node, route: bestPath(graph, node), days: overdueBy(node, asOf) ?? 0 }))
-    .filter((entry): entry is { node: GraphNode; route: NonNullable<ReturnType<typeof bestPath>>; days: number } =>
+    .map((node) => ({
+      node,
+      route: stated ? bestPath(graph, node) : { path: [node, goalNode] },
+      days: overdueBy(node, asOf) ?? 0,
+    }))
+    .filter((entry): entry is { node: GraphNode; route: { path: GraphNode[] }; days: number } =>
       entry.route !== null,
     );
   if (!candidates.length) return null;
 
-  // Everything reachable from a late step: anything in here is waiting on one.
-  const candidateIds = new Set(candidates.map((entry) => entry.node.id));
-  const downstreamOfCandidate = new Set<string>();
-  for (const edge of graph.edges) {
-    if (!candidateIds.has(edge.from)) continue;
-    const queue = [edge.to];
-    while (queue.length) {
-      const id = queue.shift()!;
-      if (downstreamOfCandidate.has(id)) continue;
-      downstreamOfCandidate.add(id);
-      for (const next of graph.edges.filter((item) => item.from === id)) queue.push(next.to);
-    }
-  }
-
   const ranked = [...candidates].sort((a, b) => {
-    const rootA = Number(!downstreamOfCandidate.has(a.node.id));
-    const rootB = Number(!downstreamOfCandidate.has(b.node.id));
-    if (rootA !== rootB) return rootB - rootA;
     if (a.days !== b.days) return b.days - a.days;
     // Same lateness: the one promised earliest is the one that has been waited
     // on longest, so it is the one to chase.

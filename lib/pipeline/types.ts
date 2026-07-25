@@ -141,11 +141,6 @@ export interface GraphEdge {
   from: string;
   to: string;
   kind: EdgeKind;
-  /**
-   * True when the edge comes from the deterministic date-ordered fallback
-   * rather than a dependency the letters state in words. Never LLM-authored.
-   */
-  inferred?: boolean;
 }
 
 /** Where the pathway is trying to get to, always named by the letters. */
@@ -174,6 +169,13 @@ export interface PathwayGraph {
    * the goal. Anything outside this list is an off-chain item the UI demotes.
    */
   chainIds: string[];
+  /**
+   * Whether any letter writes down what blocks what. False means the pathway is
+   * a set of dated steps with no stated dependency between them — real letters
+   * often are — and the graph must not demote a step or claim a route it was
+   * never told about.
+   */
+  statedDependencies: boolean;
 }
 
 export interface Stall {

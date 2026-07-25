@@ -81,13 +81,10 @@ describe("buildGraph", () => {
       kind: "awaiting",
     });
 
-    // No STATED edge is invented between departments without a stated join. The
-    // date-ordered timeline does link this step forward so it can be placed on
-    // the rail, but that edge is marked `inferred` and is worth less than a
-    // stated one everywhere a decision is made.
-    expect(
-      graph.edges.some((edge) => edge.from === id("TB screening bloods") && !edge.inferred),
-    ).toBe(false);
+    // No edge is invented between departments without a stated join. Happening
+    // earlier is not a dependency: the step is placed on the timeline by its
+    // own date, and nothing claims the next step was waiting on it.
+    expect(graph.edges.some((edge) => edge.from === id("TB screening bloods"))).toBe(false);
   });
 });
 

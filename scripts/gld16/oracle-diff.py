@@ -37,20 +37,18 @@ print("\nGOAL:", g["goal"])
 print("\nCHAIN (%d):" % len(g["chainIds"]))
 for i in g["chainIds"]:
     n = by[i]
-    print("  %-12s %-46s %-10s ord=%-11s rep=%-11s due=%-11s %s" % (
-        n["kind"], n["label"][:46], n["status"], n["ordered_date"],
-        n["report_date"], n["due_date"], n["date_source"]))
+    print("  %-12s %-44s %-9s tl=%-11s due=%-11s %-7s %s" % (
+        n["kind"], n["label"][:44], n["status"], n["timelineDate"],
+        n["dueDate"], n["dateSource"],
+        ("OVERDUE %dd" % n["overdue"]["daysOverdue"]) if n.get("overdue") else ""))
 
 off = [n for n in g["nodes"] if n["id"] not in g["chainIds"]]
 print("\nOFF-CHAIN (%d):" % len(off), [n["label"][:40] for n in off])
 
-print("\nOVERDUE (%d):" % len(g["overdue"]))
-for n in g["overdue"]:
-    print("  ", n["label"][:50], "| due", n["due_date"], "|", n["due_basis"])
-
-print("\nDELAYS (%d):" % len(g["delays"]))
-for x in g["delays"]:
-    print("  ", x["description"])
+od = [n for n in g["nodes"] if n.get("overdue")]
+print("\nOVERDUE (%d):" % len(od))
+for n in sorted(od, key=lambda n: -n["overdue"]["daysOverdue"]):
+    print("   %-44s %3dd | %s" % (n["label"][:44], n["overdue"]["daysOverdue"], n["overdue"]["basis"]))
 
 s = d["stall"]
 print("\nSTALL:", s["stalledNode"]["label"] if s else None)
