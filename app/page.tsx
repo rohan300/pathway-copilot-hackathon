@@ -4,11 +4,13 @@ import { useEffect, useState } from "react";
 import type {
   DraftResult,
   DraftTarget,
-  StateMachineResult,
+  Extraction,
+  PathwayGraph,
+  Stall,
   VitalsResult,
 } from "@/lib/pipeline/types";
 import {
-  computeState,
+  computeGraph,
   draftEscalation,
   extractSample,
   extractUpload,
@@ -16,11 +18,9 @@ import {
   joinVitals,
 } from "@/lib/client";
 import {
-  buildMilestones,
   parseCsvSeries,
   pathwayStartDate,
   type CsvPoint,
-  type DocRecord,
 } from "@/lib/view";
 import AppHeader from "./components/AppHeader";
 import PathwayPanel from "./components/PathwayPanel";
@@ -32,14 +32,15 @@ function errMsg(e: unknown, fallback: string): string {
 }
 
 /**
- * The whole Pathway Copilot screen — one page, single demo path. Orchestrates
- * the pipeline (extract → state machine → vitals → draft) and holds all state
+ * The whole Critical Path screen — one page, single demo path. Orchestrates
+ * the pipeline (extract → graph → stall → draft) and holds all state
  * in memory. Nothing is persisted. Layout and voice follow the picked
  * "Companion" mockup; data is the real GLD-4 pipeline.
  */
 export default function Home() {
-  const [docs, setDocs] = useState<DocRecord[]>([]);
-  const [state, setState] = useState<StateMachineResult | null>(null);
+  const [docs, setDocs] = useState<Array<Extraction & { id: string; source: string }>>([]);
+  const [graph, setGraph] = useState<PathwayGraph | null>(null);
+  const [stall, setStall] = useState<Stall | null>(null);
   const [vitals, setVitals] = useState<VitalsResult | null>(null);
   const [series, setSeries] = useState<CsvPoint[]>([]);
   const [csvText, setCsvText] = useState<string>("");
@@ -56,8 +57,6 @@ export default function Home() {
   const [draftError, setDraftError] = useState<string | null>(null);
 
   const hasData = docs.length > 0;
-  const milestones = buildMilestones(docs, state);
-
   /** Load the bundled sample pathway end-to-end (no upload needed). */
   async function loadSample() {
     setBusy(true);
@@ -69,16 +68,17 @@ export default function Home() {
       const extractions = await Promise.all(
         samples.letters.map((l) => extractSample(l.id)),
       );
-      const nextDocs: DocRecord[] = extractions.map((e, i) => ({
+      const nextDocs: Array<Extraction & { id: string; source: string }> = extractions.map((e, i) => ({
         ...e,
         id: samples.letters[i].id,
         source: `${samples.letters[i].title}.pdf`,
       }));
-      const nextState = await computeState(extractions);
+      const nextResult = await computeGraph(extractions);
       const nextVitals = await joinVitals(samples.fitbitCsv, samples.startDate);
 
       setDocs(nextDocs);
-      setState(nextState);
+      setGraph(nextResult.graph);
+      setStall(nextResult.stall);
       setStartDate(samples.startDate);
       setCsvText(samples.fitbitCsv);
       setSeries(parseCsvSeries(samples.fitbitCsv));
@@ -108,10 +108,11 @@ export default function Home() {
       );
       const nextDocs = [...docs, ...added];
       const start = pathwayStartDate(nextDocs) ?? startDate;
-      const nextState = await computeState(nextDocs);
+      const nextResult = await computeGraph(nextDocs);
 
       setDocs(nextDocs);
-      setState(nextState);
+      setGraph(nextResult.graph);
+      setStall(nextResult.stall);
       setStartDate(start);
 
       // Re-join vitals against the (possibly new) pathway start.
@@ -149,16 +150,16 @@ export default function Home() {
     }
   }
 
-  // Draft (re)generates whenever the state, vitals, or chosen target changes.
+  // Draft (re)generates whenever the stall, vitals, or chosen target changes.
   useEffect(() => {
-    if (!state) {
+    if (!stall) {
       setDraft(null);
       return;
     }
     let alive = true;
     setDrafting(true);
     setDraftError(null);
-    draftEscalation({ state, vitals, target })
+    draftEscalation({ stall, vitals, target })
       .then((d) => {
         if (alive) setDraft(d);
       })
@@ -171,7 +172,7 @@ export default function Home() {
     return () => {
       alive = false;
     };
-  }, [state, vitals, target]);
+  }, [stall, vitals, target]);
 
   return (
     <main className="flex h-screen flex-col overflow-hidden">
@@ -187,8 +188,8 @@ export default function Home() {
 
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-5 px-6 pb-6 md:px-8 lg:grid-cols-3">
         <PathwayPanel
-          milestones={milestones}
-          state={state}
+          graph={graph}
+          stall={stall}
           loading={busy && !hasData}
           error={error}
           hasData={hasData}
@@ -207,7 +208,7 @@ export default function Home() {
           onSelectTarget={setTarget}
           loading={drafting}
           error={draftError}
-          hasState={Boolean(state)}
+          hasState={Boolean(stall)}
         />
       </div>
     </main>

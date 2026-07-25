@@ -1,15 +1,16 @@
 /**
  * Frontend API client for the Pathway Copilot pipeline.
  *
- * Wraps the four pipeline routes (+ the samples fixture) shipped in GLD-4.
+ * Wraps the graph pipeline routes (+ the samples fixture).
  * Types come from the pipeline's own source of truth (`lib/pipeline/types`) —
  * a type-only import, so no server code is pulled into the client bundle.
- * Each route wraps its payload under a single key ({ extraction }, { state },
+ * Each route wraps its payload under a single key ({ extraction }, { graph, stall },
  * { vitals }, { draft }); this client unwraps them so callers get plain values.
  */
 import type {
   Extraction,
-  StateMachineResult,
+  PathwayGraph,
+  Stall,
   VitalsResult,
   DraftResult,
   DraftTarget,
@@ -18,7 +19,7 @@ import type {
 export const ROUTES = {
   samples: "/api/samples",
   extract: "/api/extract",
-  state: "/api/state",
+  graph: "/api/graph",
   vitals: "/api/vitals",
   draft: "/api/draft",
 } as const;
@@ -88,17 +89,30 @@ export async function extractUpload(input: {
   return unwrap<Extraction>(res, "extraction");
 }
 
-/** Run the deterministic state machine over the extracted letters. */
-export async function computeState(
+/** Build the deterministic dependency graph and identify its stall. */
+export async function computeGraph(
   extractions: Extraction[],
   asOf?: string,
-): Promise<StateMachineResult> {
-  const res = await fetch(ROUTES.state, {
+): Promise<{ graph: PathwayGraph; stall: Stall | null }> {
+  const res = await fetch(ROUTES.graph, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ extractions, asOf }),
   });
-  return unwrap<StateMachineResult>(res, "state");
+  // Two keys in one payload, so unwrap() (single-key) does not apply; the
+  // error handling has to match it explicitly.
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const body = await res.json();
+      detail = body?.error || body?.message || detail;
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new ApiError(detail || `Request failed (${res.status})`, res.status);
+  }
+  const body = await res.json();
+  return { graph: body.graph as PathwayGraph, stall: body.stall as Stall | null };
 }
 
 /** Join a Fitbit CSV against the pathway start date. Deltas only. */
@@ -116,7 +130,7 @@ export async function joinVitals(
 
 /** Draft a ready-to-send administrative escalation for the chosen target. */
 export async function draftEscalation(input: {
-  state: StateMachineResult;
+  stall: Stall;
   vitals: VitalsResult | null;
   target: DraftTarget;
 }): Promise<DraftResult> {

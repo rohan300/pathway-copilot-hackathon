@@ -1,5 +1,5 @@
 /**
- * Agent 4 — Drafter (LLM). Turns the deterministic state-machine output plus
+ * Agent 4 — Drafter (LLM). Turns the deterministic stall output plus
  * vitals deltas into ready-to-send text for a chosen target.
  *
  * Voice: polite, specific, factual, firm. Cites exact dates and day counts.
@@ -47,14 +47,16 @@ function vitalsContext(vitals: VitalsResult | null): string | null {
 
 /** Shared factual bullets — the ground truth both the LLM and mock draft from. */
 function factsBlock(input: DraftInput): string {
-  const { state, vitals, meta } = input;
+  const { stall, vitals, meta } = input;
+  const since = stall.sinceDate || "not written";
+  const chain = stall.chain.map((node) => node.label).join(" -> ");
   const lines = [
-    `Current pathway stage: ${state.current_stage.replace("_", " ")}`,
-    `Days in current stage: ${state.days_in_stage}`,
-    `Total days since referral: ${state.total_days_elapsed}`,
-    `Overdue: ${state.overdue ? "yes" : "no"}`,
-    `Outstanding step (blocker): ${state.blocker}`,
-    `Benchmark: ${state.benchmark_comparison}`,
+    `Stalled node: ${stall.stalledNode.label}`,
+    `Owning department: ${stall.owningDept || "not identified"}`,
+    `Stalled since: ${since}`,
+    `Days stalled: ${stall.daysStalled}`,
+    `Expected window for this node: ${stall.expectedDays === null ? "not defined" : `${stall.expectedDays} days`}`,
+    `Downstream dependency chain: ${chain}`,
   ];
   if (meta?.patient_name) lines.push(`Patient name: ${meta.patient_name}`);
   if (meta?.hospital) lines.push(`Hospital: ${meta.hospital}`);
@@ -69,16 +71,14 @@ function factsBlock(input: DraftInput): string {
 // ---------------------------------------------------------------------------
 
 function mockMessage(input: DraftInput, target: Exclude<DraftTarget, "clinician_summary">): string {
-  const { state, meta } = input;
+  const { stall, meta } = input;
   const name = meta?.patient_name || "[Your name]";
   const nhs = meta?.nhs_number ? ` (NHS number ${meta.nhs_number})` : "";
   const by = requestedDateISO();
-  const stage = state.current_stage.replace("_", " ");
   const vc = vitalsContext(input.vitals);
-
-  const overdueLine = state.overdue
-    ? `I have now been at the ${stage} stage for ${state.days_in_stage} days, which is beyond the expected timeframe for this step.`
-    : `I have been at the ${stage} stage for ${state.days_in_stage} days.`;
+  const dateLine = stall.sinceDate
+    ? `It has been ${stall.daysStalled} days since ${stall.stalledNode.label} was recorded on ${stall.sinceDate}.`
+    : `${stall.stalledNode.label} is overdue, although its start date was not written in the letters.`;
 
   const opener =
     target === "pals"
@@ -88,11 +88,11 @@ function mockMessage(input: DraftInput, target: Exclude<DraftTarget, "clinician_
   return [
     opener,
     ``,
-    `I am writing to ask for help moving my IBD biologics pathway forward. My name is ${name}${nhs}.`,
+    `I am writing to ask for help moving my IBD pathway forward. My name is ${name}${nhs}.`,
     ``,
-    `${overdueLine} In total it has been ${state.total_days_elapsed} days since my referral. ${state.benchmark_comparison}`,
+    `${dateLine} The expected window for this step is ${stall.expectedDays ?? "an unspecified"} days.`,
     ``,
-    `The outstanding step is: ${state.blocker}.`,
+    `The outstanding item is ${stall.stalledNode.label}, owned by ${stall.owningDept || "the relevant department"}. It is holding up ${stall.chain[stall.chain.length - 1]?.label || "the next pathway step"}.`,
     vc ? `` : ``,
     vc ?? ``,
     ``,
@@ -109,17 +109,16 @@ function mockMessage(input: DraftInput, target: Exclude<DraftTarget, "clinician_
 }
 
 function mockClinicianSummary(input: DraftInput): { text: string; questions: string[] } {
-  const { state } = input;
-  const stage = state.current_stage.replace("_", " ");
+  const { stall } = input;
   const vc = vitalsContext(input.vitals);
   const text = [
-    `PATHWAY SUMMARY — IBD biologics`,
+    `PATHWAY SUMMARY — Critical Path`,
     ``,
-    `• Current stage: ${stage}`,
-    `• Days in current stage: ${state.days_in_stage}${state.overdue ? " (beyond expected timeframe)" : ""}`,
-    `• Total days since referral: ${state.total_days_elapsed}`,
-    `• Benchmark: ${state.benchmark_comparison}`,
-    `• Outstanding step: ${state.blocker}`,
+    `• Stalled node: ${stall.stalledNode.label}`,
+    `• Owning department: ${stall.owningDept || "Not identified"}`,
+    `• Stalled since: ${stall.sinceDate || "Date not written"}`,
+    `• Days stalled: ${stall.daysStalled}${stall.expectedDays !== null ? ` (expected window ${stall.expectedDays} days)` : ""}`,
+    `• Downstream chain: ${stall.chain.map((node) => node.label).join(" → ")}`,
     vc ? `• Wearable context (objective, non-clinical): ${vc}` : ``,
     ``,
     `This summary is administrative and reconstructed from the patient's own`,
@@ -129,9 +128,9 @@ function mockClinicianSummary(input: DraftInput): { text: string; questions: str
     .join("\n");
 
   const questions = [
-    `What is the current status of: ${state.blocker}?`,
-    `What is the expected date for the next step to be completed?`,
-    `Is there anything I can do to help avoid further delay?`,
+    `What is the current status of ${stall.stalledNode.label}?`,
+    `Which department owns this outstanding item?`,
+    `What date is recorded for the next administrative update?`,
     `Who should I contact if I do not hear back by that date?`,
   ];
   return { text, questions };
