@@ -1,0 +1,53 @@
+@import "tailwindcss";
+
+/* ============================================================
+   Pathway Copilot — "Companion" design tokens (GLD-5)
+   Warm humanist consumer-health palette: cream canvas, sage
+   action, warm clay for overdue. Registered as Tailwind v4 theme
+   tokens so utilities like `bg-card`, `text-clay`, `font-display`
+   resolve to these values.
+   ============================================================ */
+@theme {
+  --color-canvas: #f3f0e9;
+  --color-card: #fffdf8;
+  --color-card-mut: #faf8f2;
+  --color-ink: #2c332e;
+  --color-ink-2: #5c665e;
+  --color-ink-3: #8f978f;
+  --color-sage: #5b8a72;
+  --color-sage-soft: #e4ede7;
+  --color-sage-deep: #3f6b56;
+  --color-clay: #c56a52;
+  --color-clay-soft: #f6e5df;
+  --color-clay-ink: #7a3325;
+  --color-gold: #b98b3e;
+  --color-line: #efe9dd;
+  --color-line-2: #e3ddcf;
+
+  --font-display: var(--font-fraunces), "Iowan Old Style", Georgia, serif;
+
+  --shadow-soft: 0 2px 10px rgba(44, 51, 46, 0.04);
+  --shadow-card: 0 3px 14px rgba(44, 51, 46, 0.05);
+  --shadow-lift: 0 3px 14px rgba(197, 106, 82, 0.14);
+}
+
+:root {
+  --background: var(--color-canvas);
+  --foreground: var(--color-ink);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: "Söhne", "Avenir Next", ui-sans-serif, -apple-system,
+    "Segoe UI", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Native <details> disclosure — hide default marker; we supply our own chevron. */
+summary {
+  list-style: none;
+}
+summary::-webkit-details-marker {
+  display: none;
+}
