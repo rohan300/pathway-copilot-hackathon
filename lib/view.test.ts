@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { GraphNode, PathwayGraph, Stall } from "@/lib/pipeline/types";
-import { buildPathwayView, noStallHeadline } from "@/lib/view";
+import {
+  buildPathwayView,
+  buildTimeline,
+  describeSpan,
+  noStallHeadline,
+  timelineOrder,
+  timelineSpanLabel,
+} from "@/lib/view";
 
 function node(id: string, over: Partial<GraphNode> = {}): GraphNode {
   return {
@@ -79,6 +86,147 @@ describe("buildPathwayView", () => {
 
   it("is empty for a null graph", () => {
     expect(buildPathwayView(null, null)).toEqual({ chain: [], others: [], goal: null, current: null });
+  });
+});
+
+describe("buildTimeline", () => {
+  const timeline = (g = graph(), s: Stall | null = null) => buildTimeline(buildPathwayView(g, s), s);
+
+  it("lays the dated steps out oldest first", () => {
+    expect(timeline().dated.map((e) => e.node.id)).toEqual(["referral", "clinic", "xray"]);
+  });
+
+  it("holds an undated, unfinished goal back as the destination", () => {
+    const t = timeline();
+    expect(t.destination?.node.id).toBe("funding");
+    expect(t.dated.some((e) => e.node.id === "funding")).toBe(false);
+  });
+
+  it("puts a goal that already happened on the rail at its own date", () => {
+    const g = graph({
+      nodes: [
+        node("referral", { ordered_date: "2026-01-20", status: "done" }),
+        node("funding", { report_date: "2026-03-02", status: "reported" }),
+      ],
+      chainIds: ["referral", "funding"],
+    });
+    const t = timeline(g);
+    expect(t.destination).toBeNull();
+    expect(t.dated.map((e) => e.node.id)).toEqual(["referral", "funding"]);
+  });
+
+  it("keeps months with nothing in them, so a gap reads as a gap", () => {
+    const g = graph({
+      nodes: [
+        node("a", { ordered_date: "2026-01-12" }),
+        node("b", { ordered_date: "2026-04-18" }),
+      ],
+      chainIds: ["a", "b"],
+      goal: { nodeId: "b", label: "b", dept: null, source: "derived" },
+    });
+    const t = timeline(g);
+    expect(t.months.map((m) => m.key)).toEqual(["2026-01", "2026-02", "2026-03", "2026-04"]);
+    expect(t.months.filter((m) => m.entries.length === 0).map((m) => m.key)).toEqual([
+      "2026-02",
+      "2026-03",
+    ]);
+  });
+
+  it("drops the empty-month axis once the span is too long to be useful", () => {
+    const g = graph({
+      nodes: [node("a", { ordered_date: "2021-01-12" }), node("b", { ordered_date: "2026-04-18" })],
+      chainIds: ["a", "b"],
+      goal: { nodeId: "b", label: "b", dept: null, source: "derived" },
+    });
+    expect(timeline(g).months.map((m) => m.key)).toEqual(["2021-01", "2026-04"]);
+  });
+
+  it("keeps an undated step visible instead of dropping it", () => {
+    const g = graph({
+      nodes: [node("a", { ordered_date: "2026-01-12" }), node("culture"), node("funding")],
+      chainIds: ["a", "culture", "funding"],
+    });
+    const t = timeline(g);
+    expect(t.undated.map((e) => e.node.id)).toEqual(["culture"]);
+    expect(t.destination?.node.id).toBe("funding");
+  });
+
+  it("degrades an unparseable date to undated rather than rendering it", () => {
+    const g = graph({
+      nodes: [node("a", { ordered_date: "not-a-date" }), node("funding")],
+      chainIds: ["a", "funding"],
+    });
+    const t = timeline(g);
+    expect(t.undated.map((e) => e.node.id)).toEqual(["a"]);
+    expect(t.dated).toEqual([]);
+    expect(t.months).toEqual([]);
+  });
+
+  it("marks only the stalled step overdue, reporting what the API computed", () => {
+    const t = timeline(graph(), stall);
+    const overdue = t.dated.filter((e) => e.overdue);
+    expect(overdue.map((e) => e.node.id)).toEqual(["xray"]);
+    expect(overdue[0].overdue?.phrase).toBe("waiting 6 months");
+    expect(overdue[0].overdue?.detail).toBe("expected within 28 days");
+  });
+
+  it("never invents a due date the API didn't give", () => {
+    const t = timeline(graph(), { ...stall, expectedDays: null });
+    expect(t.dated.find((e) => e.node.id === "xray")?.overdue?.detail).toBeNull();
+  });
+
+  it("names a slow turnaround but stays quiet about a quick one (AC7)", () => {
+    const g = graph({
+      nodes: [
+        node("slow", { ordered_date: "2026-02-06", report_date: "2026-03-13" }),
+        node("quick", { ordered_date: "2026-03-13", report_date: "2026-03-16" }),
+        node("funding"),
+      ],
+      chainIds: ["slow", "quick", "funding"],
+    });
+    const byId = new Map(timeline(g).dated.map((e) => [e.node.id, e]));
+    expect(byId.get("slow")?.turnaroundDays).toBe(35);
+    expect(byId.get("quick")?.turnaroundDays).toBeNull();
+  });
+
+  it("flags finished steps as settled so they can recede", () => {
+    const byId = new Map(timeline().dated.map((e) => [e.node.id, e.settled]));
+    expect(byId.get("referral")).toBe(true);
+    expect(byId.get("xray")).toBe(false);
+  });
+
+  it("orders every chain step exactly once, dated then undated then goal", () => {
+    const g = graph({
+      nodes: [node("a", { ordered_date: "2026-01-12" }), node("culture"), node("funding")],
+      chainIds: ["a", "culture", "funding"],
+    });
+    expect(timelineOrder(timeline(g)).map((e) => e.node.id)).toEqual(["a", "culture", "funding"]);
+  });
+
+  it("is empty for a pathway with no steps at all", () => {
+    const t = buildTimeline(buildPathwayView(null, null), null);
+    expect(t).toEqual({ months: [], dated: [], undated: [], destination: null });
+  });
+});
+
+describe("timelineSpanLabel", () => {
+  it("states the arc from first step to last", () => {
+    const label = timelineSpanLabel(buildTimeline(buildPathwayView(graph(), null), null));
+    expect(label).toBe("20 Jan – 6 Feb 2026 · 2 weeks");
+  });
+
+  it("has nothing to say when no step is dated", () => {
+    expect(timelineSpanLabel(buildTimeline(buildPathwayView(null, null), null))).toBeNull();
+  });
+});
+
+describe("describeSpan", () => {
+  it("talks in the units the letters use", () => {
+    expect(describeSpan(1)).toBe("1 day");
+    expect(describeSpan(4)).toBe("4 days");
+    expect(describeSpan(35)).toBe("5 weeks");
+    expect(describeSpan(24)).toBe("3 weeks");
+    expect(describeSpan(169)).toBe("6 months");
   });
 });
 
