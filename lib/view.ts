@@ -48,21 +48,21 @@ export interface PathwayView {
 /**
  * Turn a graph into the shape the panel renders.
  *
- * The backend supplies `chainIds` and `goal`; both are preferred whenever
- * present. They stay optional so the UI degrades to an edge-derived chain
- * rather than falling back to a flat, equal-weight node list.
+ * `goal` and `chainIds` are required on PathwayGraph and computed by
+ * lib/pipeline/graph.ts, so the chain is read straight off the API rather than
+ * re-derived here — the backend is the single source of truth for what is on
+ * the path to the goal.
  */
 export function buildPathwayView(graph: PathwayGraph | null, stall: Stall | null): PathwayView {
   if (!graph) return { chain: [], others: [], goal: null, current: null };
   const byId = new Map(graph.nodes.map((node) => [node.id, node]));
 
-  const fromApi = (graph.chainIds ?? [])
+  const chain = graph.chainIds
     .map((id) => byId.get(id))
     .filter((node): node is GraphNode => Boolean(node));
-  const chain = fromApi.length > 0 ? fromApi : deriveChain(graph, stall);
 
-  // The stall's own chain is authoritative about the steps after the stalled
-  // node, so anything it names that the chain missed is appended in order.
+  // The stall's own chain runs from the stalled node down to the goal, so
+  // anything it names that chainIds missed is appended rather than dropped.
   const seen = new Set(chain.map((node) => node.id));
   for (const node of stall?.chain ?? []) {
     if (!seen.has(node.id)) {
@@ -71,21 +71,17 @@ export function buildPathwayView(graph: PathwayGraph | null, stall: Stall | null
     }
   }
 
-  const last = chain[chain.length - 1] ?? null;
-  const goal =
-    graph.goal ??
-    (last ? { nodeId: last.id, label: last.label, dept: last.dept, source: "inferred" } : null);
-
   const current =
     (stall && (byId.get(stall.stalledNode.id) ?? stall.stalledNode)) ??
     chain.find((node) => !isSettled(node)) ??
-    last;
+    chain[chain.length - 1] ??
+    null;
 
   const others = graph.nodes
     .filter((node) => !seen.has(node.id))
     .sort((a, b) => (nodeDate(a) ?? "").localeCompare(nodeDate(b) ?? ""));
 
-  return { chain, others, goal, current };
+  return { chain, others, goal: graph.goal, current };
 }
 
 function nodeDate(node: GraphNode): string | null {
@@ -93,63 +89,17 @@ function nodeDate(node: GraphNode): string | null {
 }
 
 /**
- * Longest dependency path through the graph, used only until the backend
- * emits `chainIds`. Edges point blocker → blocked, so the deepest path ends
- * at the terminal step the pathway is working toward.
+ * Headline for the no-stall panel — never a bare node count. Codes are the
+ * ones lib/pipeline/graph.ts `explainNoStall` actually emits; the reason's own
+ * `message` carries the detail underneath.
  */
-function deriveChain(graph: PathwayGraph, stall: Stall | null): GraphNode[] {
-  if (graph.nodes.length === 0) return [];
-  const byId = new Map(graph.nodes.map((node) => [node.id, node]));
-  const next = new Map<string, string[]>();
-  for (const edge of graph.edges) {
-    if (!byId.has(edge.from) || !byId.has(edge.to)) continue;
-    next.set(edge.from, [...(next.get(edge.from) ?? []), edge.to]);
-  }
-
-  const memo = new Map<string, string[]>();
-  const walk = (id: string, onPath: Set<string>): string[] => {
-    const cached = memo.get(id);
-    if (cached) return cached;
-    if (onPath.has(id)) return [id]; // cycle guard — never recurse into it twice
-    onPath.add(id);
-    let best: string[] = [];
-    for (const to of next.get(id) ?? []) {
-      const path = walk(to, onPath);
-      if (path.length > best.length) best = path;
-    }
-    onPath.delete(id);
-    const result = [id, ...best];
-    memo.set(id, result);
-    return result;
-  };
-
-  let longest: string[] = [];
-  for (const node of graph.nodes) {
-    const path = walk(node.id, new Set());
-    if (path.length > longest.length) longest = path;
-  }
-
-  // A graph with no usable edges still has a pathway: the dated steps in order,
-  // with the stalled one guaranteed to appear.
-  if (longest.length < 2) {
-    const dated = graph.nodes
-      .filter((node) => nodeDate(node) || node.id === stall?.stalledNode.id)
-      .sort((a, b) => (nodeDate(a) ?? "").localeCompare(nodeDate(b) ?? ""));
-    return dated.length > 0 ? dated : [];
-  }
-  return longest.map((id) => byId.get(id)).filter((node): node is GraphNode => Boolean(node));
-}
-
-/** Headline for the no-stall panel — never a bare node count. */
 export function noStallHeadline(reason: NoStallReason | null): string {
   switch (reason?.code) {
-    case "no_dated_steps":
+    case "no_dated_nodes":
       return "No dated steps to time";
-    case "no_goal_inferred":
-      return "We couldn't tell what this pathway is working toward";
-    case "pathway_complete":
-      return "This pathway looks complete";
-    case "within_expected_windows":
+    case "no_path_to_goal":
+      return "Nothing open connects to your goal";
+    case "nothing_overdue":
       return "Nothing is past its expected window yet";
     default:
       return "No overdue step found";

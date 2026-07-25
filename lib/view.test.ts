@@ -17,7 +17,7 @@ function node(id: string, over: Partial<GraphNode> = {}): GraphNode {
   };
 }
 
-/** referral → clinic → xray → funding, plus one unrelated item. */
+/** referral → clinic → xray → funding, plus one item off the chain. */
 function graph(over: Partial<PathwayGraph> = {}): PathwayGraph {
   return {
     nodes: [
@@ -32,6 +32,8 @@ function graph(over: Partial<PathwayGraph> = {}): PathwayGraph {
       { from: "clinic", to: "xray", kind: "blocks" },
       { from: "xray", to: "funding", kind: "blocks" },
     ],
+    goal: { nodeId: "funding", label: "Start filgotinib", dept: "Imperial Gastroenterology", source: "stated" },
+    chainIds: ["referral", "clinic", "xray", "funding"],
     ...over,
   };
 }
@@ -46,24 +48,20 @@ const stall: Stall = {
 };
 
 describe("buildPathwayView", () => {
-  it("prefers the chain and goal the API supplies", () => {
-    const view = buildPathwayView(
-      graph({
-        chainIds: ["referral", "clinic", "xray", "funding"],
-        goal: { nodeId: "funding", label: "Start filgotinib", dept: "Imperial", source: "stated" },
-      }),
-      stall,
-    );
-    expect(view.chain.map((n) => n.id)).toEqual(["referral", "clinic", "xray", "funding"]);
-    expect(view.goal?.label).toBe("Start filgotinib");
-    expect(view.others.map((n) => n.id)).toEqual(["unrelated"]);
-  });
-
-  it("derives the chain from edges until the backend sends chainIds", () => {
+  it("reads the chain and goal straight off the API", () => {
     const view = buildPathwayView(graph(), stall);
     expect(view.chain.map((n) => n.id)).toEqual(["referral", "clinic", "xray", "funding"]);
-    expect(view.goal?.nodeId).toBe("funding");
-    expect(view.goal?.source).toBe("inferred");
+    expect(view.goal?.label).toBe("Start filgotinib");
+  });
+
+  it("demotes everything off chainIds, oldest first", () => {
+    expect(buildPathwayView(graph(), null).others.map((n) => n.id)).toEqual(["unrelated"]);
+  });
+
+  it("appends steps the stall names that chainIds omitted", () => {
+    const view = buildPathwayView(graph({ chainIds: ["referral", "clinic"] }), stall);
+    expect(view.chain.map((n) => n.id)).toEqual(["referral", "clinic", "xray", "funding"]);
+    expect(view.others.map((n) => n.id)).toEqual(["unrelated"]);
   });
 
   it("points at the stalled node as where the pathway currently sits", () => {
@@ -74,30 +72,9 @@ describe("buildPathwayView", () => {
     expect(buildPathwayView(graph(), null).current?.id).toBe("xray");
   });
 
-  it("orders undated, edgeless graphs by date rather than dropping them", () => {
-    const flat = buildPathwayView(
-      {
-        nodes: [node("b", { ordered_date: "2026-02-06" }), node("a", { ordered_date: "2026-01-20" })],
-        edges: [],
-      },
-      null,
-    );
-    expect(flat.chain.map((n) => n.id)).toEqual(["a", "b"]);
-    expect(flat.others).toEqual([]);
-  });
-
-  it("survives a cyclic graph", () => {
-    const cyclic = buildPathwayView(
-      {
-        nodes: [node("a"), node("b")],
-        edges: [
-          { from: "a", to: "b", kind: "blocks" },
-          { from: "b", to: "a", kind: "blocks" },
-        ],
-      },
-      null,
-    );
-    expect(cyclic.chain.length).toBeGreaterThan(0);
+  it("tolerates chainIds naming a node the graph doesn't carry", () => {
+    const view = buildPathwayView(graph({ chainIds: ["referral", "ghost", "funding"] }), null);
+    expect(view.chain.map((n) => n.id)).toEqual(["referral", "funding"]);
   });
 
   it("is empty for a null graph", () => {
@@ -106,9 +83,16 @@ describe("buildPathwayView", () => {
 });
 
 describe("noStallHeadline", () => {
-  it("says why, per code", () => {
-    expect(noStallHeadline({ code: "no_dated_steps", message: "" })).toMatch(/dated steps/i);
-    expect(noStallHeadline({ code: "within_expected_windows", message: "" })).toMatch(/expected window/i);
-    expect(noStallHeadline(null)).toMatch(/no overdue step/i);
+  it("says why, against the codes explainNoStall actually emits", () => {
+    expect(noStallHeadline({ code: "no_dated_nodes", message: "" })).toMatch(/dated steps/i);
+    expect(noStallHeadline({ code: "no_path_to_goal", message: "" })).toMatch(/connects to your goal/i);
+    expect(noStallHeadline({ code: "nothing_overdue", message: "" })).toMatch(/expected window/i);
+  });
+
+  it("never renders a bare fallback for a real API reason", () => {
+    const generic = noStallHeadline(null);
+    for (const code of ["no_dated_nodes", "no_path_to_goal", "nothing_overdue"] as const) {
+      expect(noStallHeadline({ code, message: "" })).not.toBe(generic);
+    }
   });
 });
