@@ -1,8 +1,8 @@
 /** Critical Path pipeline — public surface for the UI and API routes. */
 
 export * from "./types";
-export { extractLetter } from "./extractor";
-export type { ExtractInput } from "./extractor";
+export { extractLetter, ExtractionError } from "./extractor";
+export type { ExtractInput, LetterImage } from "./extractor";
 export { buildGraph, findStall } from "./graph";
 export { escapeHatch } from "./coverage";
 export { PRIVATE_PROVIDERS, providersFor } from "./providers";

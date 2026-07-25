@@ -11,12 +11,51 @@ import type {
 } from "./types";
 import { SAMPLE_LETTERS } from "./samples";
 
+/** One page image to send as an `image_url` content part. */
+export interface LetterImage {
+  base64: string;
+  /** Must be a real image mime — the provider rejects application/pdf here. */
+  mime: string;
+}
+
 export interface ExtractInput {
   /** Use a shipped sample letter's canned extraction (demo path). */
   sampleId?: string;
   text?: string;
-  imageBase64?: string;
-  imageMime?: string;
+  /** One entry per page for a rasterized PDF; a single entry for an image upload. */
+  images?: LetterImage[];
+  /** Optional note appended to the prompt, e.g. that only the first N pages were sent. */
+  imagesNote?: string;
+}
+
+/**
+ * A failure the caller must surface, not paper over. Extraction returning an
+ * empty result on a provider 400 is what made a broken upload look like a
+ * one-node pathway with nothing overdue (GLD-11).
+ */
+export class ExtractionError extends Error {
+  constructor(
+    message: string,
+    /** HTTP status /api/extract should answer with. */
+    readonly status = 502,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = "ExtractionError";
+  }
+}
+
+/** Only real raster images may ride in an image_url part. */
+function isSupportedImageMime(mime: string): boolean {
+  return /^image\/(png|jpeg|jpg|webp|gif)$/i.test(mime.trim());
+}
+
+/** Best-effort readable message out of an OpenAI-SDK / Runware error. */
+function providerMessage(err: unknown): string {
+  if (!err || typeof err !== "object") return String(err);
+  const e = err as { status?: number; message?: string; error?: { message?: string } };
+  const detail = e.error?.message || e.message || "unknown provider error";
+  return e.status ? `${e.status} ${detail}` : detail;
 }
 
 const INVESTIGATION_TYPES: InvestigationType[] = [
@@ -206,16 +245,41 @@ function heuristicExtract(text: string): Extraction {
   });
 }
 
-/** Extract one letter. A marked sample runs through the live provider when a key exists. */
+/**
+ * Extract one letter. A marked sample runs through the live provider when a key exists.
+ *
+ * Fallbacks apply only where they are genuinely a fallback — no key configured,
+ * so the demo still runs offline. A provider failure is never masked: it throws
+ * an ExtractionError so /api/extract answers non-200 and the UI can say what
+ * went wrong, instead of returning an empty extraction at 200.
+ */
 export async function extractLetter(input: ExtractInput): Promise<Extraction> {
   const sample = input.sampleId ? SAMPLE_LETTERS.find((item) => item.id === input.sampleId) : undefined;
   if (sample && !sample.live) return sample.extraction;
+
+  const images = input.images ?? [];
+  const badImage = images.find((image) => !isSupportedImageMime(image.mime));
+  if (badImage) {
+    // Guards the exact GLD-11 regression: a PDF must be rasterized first, never
+    // handed to the provider as a data:application/pdf image_url part.
+    throw new ExtractionError(
+      `Unsupported image type "${badImage.mime}" — pages must be rasterized to an image before extraction.`,
+      400,
+    );
+  }
 
   const client = getLLM();
   if (!client || !hasLLMKey) {
     if (sample) return sample.extraction;
     if (input.text) return heuristicExtract(input.text);
-    return normalize({ confidence: 0.25 });
+    // Nothing to work with offline: a page image needs the vision model. Say so
+    // rather than returning an empty extraction that looks like a real result.
+    throw new ExtractionError(
+      images.length
+        ? "This letter has no extractable text, so it needs the vision model — but no LLM key is configured."
+        : "Nothing to extract: provide letter text, a PDF, or an image.",
+      images.length ? 503 : 400,
+    );
   }
 
   const userContent: Array<
@@ -224,16 +288,20 @@ export async function extractLetter(input: ExtractInput): Promise<Extraction> {
   > = [];
   const text = input.text || sample?.text;
   if (text) userContent.push({ type: "text", text });
-  if (input.imageBase64) {
+  if (input.imagesNote) userContent.push({ type: "text", text: input.imagesNote });
+  for (const image of images) {
     userContent.push({
       type: "image_url",
-      image_url: { url: `data:${input.imageMime || "image/png"};base64,${input.imageBase64}` },
+      image_url: { url: `data:${image.mime};base64,${image.base64}` },
     });
   }
-  if (userContent.length === 0) return normalize({ confidence: 0.25 });
+  if (userContent.length === 0) {
+    throw new ExtractionError("Nothing to extract: provide letter text, a PDF, or an image.", 400);
+  }
 
+  let completion;
   try {
-    const completion = await client.chat.completions.create({
+    completion = await client.chat.completions.create({
       model: LLM_MODEL,
       temperature: 0,
       response_format: { type: "json_object" },
@@ -242,10 +310,18 @@ export async function extractLetter(input: ExtractInput): Promise<Extraction> {
         { role: "user", content: userContent },
       ],
     });
-    return normalize(parseJsonLoose(completion.choices[0]?.message?.content ?? "{}"));
-  } catch {
-    if (sample) return sample.extraction;
-    if (input.text) return heuristicExtract(input.text);
-    return normalize({ confidence: 0.25 });
+  } catch (err) {
+    throw new ExtractionError(
+      `The model could not read this letter (${providerMessage(err)}).`,
+      502,
+      { cause: err },
+    );
   }
+
+  const raw = completion.choices[0]?.message?.content ?? "";
+  const parsed = parseJsonLoose(raw);
+  if (!parsed || typeof parsed !== "object" || Object.keys(parsed).length === 0) {
+    throw new ExtractionError("The model returned no usable JSON for this letter.", 502);
+  }
+  return normalize(parsed);
 }

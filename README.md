@@ -77,7 +77,9 @@ which exposes a drop-in OpenAI-compatible endpoint.
 
 The app **runs end-to-end without a key.** When `RUNWARE_API_KEY` is unset, the
 extractor and drafter fall back to deterministic mocks, so the full demo path
-works offline. To enable live LLM extraction and drafting, set the key in `.env`:
+works offline. (A scanned letter is the one thing that genuinely needs the
+model — with no key it returns a 503 saying so, rather than an empty result.)
+To enable live LLM extraction and drafting, set the key in `.env`:
 
 ```
 RUNWARE_API_KEY=...
@@ -98,8 +100,11 @@ OpenAI-compatible endpoint uses **fully-hyphenated** ids of the form
 Never commit the key — store it in the secrets manager.
 
 **PDF letters.** Uploaded PDFs are handled server-side: text-based PDFs have their
-text extracted and sent as text (no vision cost); scanned/image-only PDFs fall
-back to the vision-capable model so extraction still works.
+text extracted and sent as text (no vision cost); scanned/image-only PDFs are
+rasterized page by page (150 DPI JPEG, first 5 pages) and sent as images, because
+the provider's `image_url` part only accepts real images — a raw PDF there is a
+400. Extraction failures answer non-200 with a readable message; they are never
+returned as an empty extraction at 200.
 
 **Clinical safety.** The LLM only extracts JSON and drafts prose. The clinical
 stage / urgency is decided exclusively by the deterministic state machine
