@@ -29,6 +29,7 @@ import CoverageControl, { NO_COVER, hasCover } from "./components/CoverageContro
 import PathwayPanel from "./components/PathwayPanel";
 import VitalsPanel from "./components/VitalsPanel";
 import DraftPanel from "./components/DraftPanel";
+import EscapeHatchPanel, { type PrivateTarget } from "./components/EscapeHatchPanel";
 
 function errMsg(e: unknown, fallback: string): string {
   return e instanceof Error && e.message ? e.message : fallback;
@@ -63,6 +64,14 @@ export default function Home() {
 
   const [target, setTarget] = useState<DraftTarget>("advice_line");
   const [draft, setDraft] = useState<DraftResult | null>(null);
+
+  // The private-route draft is separate state: the escape hatch is the
+  // alternative shown beside the escalation, never a replacement for it, so
+  // both drafts exist at once.
+  const [hatchTarget, setHatchTarget] = useState<PrivateTarget>("insurer_preauth");
+  const [hatchDraft, setHatchDraft] = useState<DraftResult | null>(null);
+  const [hatchDrafting, setHatchDrafting] = useState(false);
+  const [hatchError, setHatchError] = useState<string | null>(null);
 
   const [busy, setBusy] = useState(false);
   const [vitalsBusy, setVitalsBusy] = useState(false);
@@ -218,6 +227,32 @@ export default function Home() {
     };
   }, [stall, vitals, target]);
 
+  // The private-route draft only exists while there is a coverable hatch —
+  // clear it the moment the cover, or the stalled step, stops qualifying.
+  useEffect(() => {
+    if (!stall || !escapeHatch || !escapeHatch.coverable) {
+      setHatchDraft(null);
+      setHatchError(null);
+      return;
+    }
+    let alive = true;
+    setHatchDrafting(true);
+    setHatchError(null);
+    draftEscalation({ stall, vitals, target: hatchTarget, escapeHatch })
+      .then((d) => {
+        if (alive) setHatchDraft(d);
+      })
+      .catch((e) => {
+        if (alive) setHatchError(errMsg(e, "We couldn't draft the private-route message."));
+      })
+      .finally(() => {
+        if (alive) setHatchDrafting(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [stall, vitals, escapeHatch, hatchTarget]);
+
   return (
     <main className="flex h-screen flex-col overflow-hidden">
       <AppHeader
@@ -253,14 +288,27 @@ export default function Home() {
           error={vitalsError}
           hasPathway={hasData}
         />
-        <DraftPanel
-          draft={draft}
-          target={target}
-          onSelectTarget={setTarget}
-          loading={drafting}
-          error={draftError}
-          hasState={Boolean(stall)}
-        />
+        {/* RIGHT column — the escalation is the primary action and keeps the
+            column; the escape hatch sits under it as the secondary alternative
+            and collapses away entirely when there is nothing coverable. */}
+        <div className="flex min-h-0 flex-col gap-4">
+          <DraftPanel
+            draft={draft}
+            target={target}
+            onSelectTarget={setTarget}
+            loading={drafting}
+            error={draftError}
+            hasState={Boolean(stall)}
+          />
+          <EscapeHatchPanel
+            hatch={escapeHatch}
+            draft={hatchDraft}
+            target={hatchTarget}
+            onSelectTarget={setHatchTarget}
+            loading={hatchDrafting}
+            error={hatchError}
+          />
+        </div>
       </div>
     </main>
   );
