@@ -299,6 +299,7 @@ export default function Home() {
             loading={drafting}
             error={draftError}
             hasState={Boolean(stall)}
+            stall={stall}
           />
           <EscapeHatchPanel
             hatch={escapeHatch}
