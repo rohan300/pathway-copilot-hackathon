@@ -20,6 +20,10 @@ function node(id: string, over: Partial<GraphNode> = {}): GraphNode {
     ordered_date: null,
     report_date: null,
     expected_days: null,
+    timelineDate: null,
+    dateSource: null,
+    dueDate: null,
+    overdue: null,
     ...over,
   };
 }
@@ -52,6 +56,9 @@ const stall: Stall = {
   sinceDate: "2026-02-06",
   daysStalled: 169,
   expectedDays: 28,
+  dueDate: null,
+  daysOverdue: 141,
+  explanation: "Start filgotinib cannot go ahead until xray is resolved.",
 };
 
 describe("buildPathwayView", () => {

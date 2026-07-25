@@ -4,6 +4,7 @@
  */
 
 import { getLLM, hasLLMKey, LLM_MODEL, parseJsonLoose } from "../provider";
+import { typeFromName } from "./stateMachine";
 import type {
   Extraction,
   InvestigationStatus,
@@ -95,17 +96,21 @@ Return STRICT JSON only — no prose and no markdown fences. Use exactly this sc
   "dependencies": [{"blocked_item": string, "blocking_item": string, "stated_status": string | null}],
   "mdt": [{"date": "YYYY-MM-DD" | null, "outcome": string | null, "awaiting": string | null}],
   "stated_goal": string | null,
+  "follow_ups": [{"item": string, "phrase": string | null, "from": string | null, "due_date": "YYYY-MM-DD" | null}],
   "confidence": number
 }
 
 Rules:
 - Extract only facts written in this letter. Never infer a date; use null when it is not written.
+- ordered_date is when the step was REQUESTED; report_date is when it was CARRIED OUT or resulted. An investigation this letter describes in the past tense with a date ("chest X-ray on 13/03/2026 showed...", "bronchoscopy performed 20-May") is a completed step: put that date in report_date, leave ordered_date null unless the request date is also written, and set status to done or reported. This applies whether or not the letter is the one that ordered it — a later letter reporting an earlier test still dates that test.
+- Dates appear in many forms — "12th January 2026", "06-FEB-2026", "20/02/26", "2nd March 2026", "13th March" — always emit YYYY-MM-DD. A UK date is day-first: 06/02/2026 is 6 February. A two-digit year in this context is 20YY.
 - Keep the department and clinician department as written, without inventing ownership.
 - Normalize investigation type to one of the enum values above.
 - Use a short slug for each investigation id, unique within this letter.
 - A finding may name the investigation it appears on and the next investigation it spawned; otherwise use null.
 - A dependency is the explicit relationship in wording such as “awaiting X before Y”.
 - stated_goal: the treatment or decision THIS letter says the pathway is working toward, in the letter's own words and as a short phrase — for example "Start filgotinib", "Approve infliximab funding". Use null when this letter states no such intent. NAME it only: never say whether it has happened, how far along it is, or what is delaying it.
+- follow_ups: every wait this letter promises in WORDS rather than as a booked date — "FU 4 weeks", "review in about 6 weeks time", "culture negative at six weeks", "carried out next week", "repeat CT at the 3-month point". Copy the interval into "phrase" exactly as written; put what is due in "item"; put the event it counts from in "from" using the letter's own words ("bronchoscopy"), or null when it counts from this letter. Use "due_date" only when the letter writes an actual calendar date it is due by. Do not compute a due date yourself and do not invent a follow-up the letter does not promise.
 - Do not diagnose, interpret, prioritize, or decide urgency. Lower confidence rather than guessing.`;
 
 function isISODate(value: unknown): value is string {
@@ -135,14 +140,7 @@ function normalizeType(value: unknown, name = ""): InvestigationType {
   }
 
   // Only recover from an omitted, invalid, or generic "other" type.
-  const text = name.toLowerCase();
-  if (/bronch/.test(text)) return "bronchoscopy";
-  if (/\bct\b|computed tomography/.test(text)) return "ct";
-  if (/\bmri\b|magnetic resonance/.test(text)) return "mri";
-  if (/consult|clearance|review/.test(text)) return "consult";
-  if (/blood|\bigra\b|screening/.test(text)) return "bloods";
-  if (/x[- ]?ray|radiograph/.test(text)) return "xray";
-  return "other";
+  return typeFromName(name);
 }
 
 function normalize(raw: unknown): Extraction {
@@ -206,6 +204,16 @@ function normalize(raw: unknown): Extraction {
       awaiting: nullableString(value.awaiting),
     };
   });
+  const followUps = (Array.isArray(o.follow_ups) ? o.follow_ups : []).flatMap((item) => {
+    const value = (item ?? {}) as Record<string, unknown>;
+    const name = nullableString(value.item);
+    const phrase = nullableString(value.phrase);
+    const dueDate = isISODate(value.due_date) ? value.due_date : null;
+    // A follow-up with neither an interval nor a date promises nothing timeable.
+    return name && (phrase || dueDate)
+      ? [{ item: name, phrase, from: nullableString(value.from), due_date: dueDate }]
+      : [];
+  });
   const confidence = typeof o.confidence === "number" ? o.confidence : 0.35;
 
   return {
@@ -218,6 +226,7 @@ function normalize(raw: unknown): Extraction {
     dependencies,
     mdt,
     stated_goal: nullableString(o.stated_goal),
+    follow_ups: followUps,
     confidence: Math.max(0, Math.min(1, confidence)),
   };
 }

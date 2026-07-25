@@ -46,7 +46,7 @@ export function POST(req: NextRequest) {
     if (!Array.isArray(body.extractions)) {
       return NextResponse.json({ error: "extractions must be an array" }, { status: 400 });
     }
-    const graph = buildGraph(body.extractions);
+    const graph = buildGraph(body.extractions, body.asOf);
     const stall = findStall(graph, body.asOf);
     const coverage = body.coverage === undefined ? null : normalizeCoverage(body.coverage);
     // escapeHatch() itself is non-null for a not-coverable stall too (coverable:
