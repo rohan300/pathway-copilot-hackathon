@@ -155,12 +155,26 @@ export interface VitalsResult {
 // Administrative drafter
 // ---------------------------------------------------------------------------
 
-export type DraftTarget = "advice_line" | "pals" | "clinician_summary";
+export type DraftTarget =
+  | "advice_line"
+  | "pals"
+  | "clinician_summary"
+  | "insurer_preauth"
+  | "nhs_private_notice";
+
+/** Targets that draft the private route rather than an NHS escalation. */
+export const PRIVATE_ROUTE_TARGETS = ["insurer_preauth", "nhs_private_notice"] as const;
 
 export interface DraftInput {
   stall: Stall;
   vitals: VitalsResult | null;
   target: DraftTarget;
+  /**
+   * Required by the private-route targets and ignored by every other target.
+   * Must be a coverable hatch — a draft is never produced for a step that
+   * cannot be routed privately.
+   */
+  escapeHatch?: EscapeHatch | null;
   meta?: {
     patient_name?: string;
     hospital?: string;
