@@ -150,11 +150,17 @@ export async function joinVitals(
   return unwrap<VitalsResult>(res, "vitals");
 }
 
-/** Draft a ready-to-send administrative escalation for the chosen target. */
+/**
+ * Draft a ready-to-send administrative escalation for the chosen target.
+ * `escapeHatch` is required by the private-route targets (insurer_preauth /
+ * nhs_private_notice) and ignored by every other one; the route refuses to
+ * draft a private-route message for a step that is not coverable.
+ */
 export async function draftEscalation(input: {
   stall: Stall;
   vitals: VitalsResult | null;
   target: DraftTarget;
+  escapeHatch?: EscapeHatch | null;
 }): Promise<DraftResult> {
   const res = await fetch(ROUTES.draft, {
     method: "POST",
