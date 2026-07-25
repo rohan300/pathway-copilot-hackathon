@@ -1,5 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { buildGraph, escapeHatch, findStall, type Coverage, type Extraction } from "@/lib/pipeline";
+import {
+  buildGraph,
+  escapeHatch,
+  explainNoStall,
+  findStall,
+  type Coverage,
+  type Extraction,
+} from "@/lib/pipeline";
 
 /**
  * Coverage is user-supplied, so every field is coerced rather than trusted:
@@ -45,7 +52,9 @@ export function POST(req: NextRequest) {
     // escapeHatch() itself is non-null for a not-coverable stall too (coverable:
     // false, with the reason) — null here means only "nothing was declared".
     const hatch = stall && coverage ? escapeHatch(stall, coverage) : null;
-    return NextResponse.json({ graph, stall, escapeHatch: hatch });
+    // A bare null stall reads as "not computed". Say which of the three it is.
+    const noStallReason = stall ? null : explainNoStall(graph, body.asOf);
+    return NextResponse.json({ graph, stall, noStallReason, escapeHatch: hatch });
   }).catch((err: unknown) =>
     NextResponse.json(
       { error: err instanceof Error ? err.message : "graph failed" },

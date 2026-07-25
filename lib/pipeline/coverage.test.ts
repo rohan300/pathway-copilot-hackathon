@@ -6,7 +6,7 @@
 
 import { describe, expect, it } from "vitest";
 import { escapeHatch } from "./coverage";
-import { buildGraph, findStall, TERMINAL_ID } from "./graph";
+import { buildGraph, findStall } from "./graph";
 import { providersFor } from "./providers";
 import { SAMPLE_LETTERS } from "./samples";
 import type { Coverage, Stall } from "./types";
@@ -15,13 +15,16 @@ const AS_OF = "2026-07-15";
 
 const GRAPH = buildGraph(SAMPLE_LETTERS.map((letter) => letter.extraction));
 
+/** The goal node the letters name — the fixtures' JAK inhibitor approval. */
+const GOAL_NODE = GRAPH.nodes.find((node) => node.id === GRAPH.goal.nodeId)!;
+
 /** The demo stall: the repeat CT chest, overdue and blocking the approval. */
 const CT_STALL = findStall(GRAPH, AS_OF)!;
 
 /** The terminal treatment approval, presented as if it were the bottleneck. */
 const APPROVAL_STALL: Stall = {
-  stalledNode: GRAPH.nodes.find((node) => node.id === TERMINAL_ID)!,
-  chain: [GRAPH.nodes.find((node) => node.id === TERMINAL_ID)!],
+  stalledNode: GOAL_NODE,
+  chain: [GOAL_NODE],
   owningDept: "Gastroenterology",
   sinceDate: "2026-03-20",
   daysStalled: 117,
@@ -73,7 +76,7 @@ describe("escapeHatch", () => {
 
     const hatch = escapeHatch(APPROVAL_STALL, mostGenerous)!;
 
-    expect(hatch.node.id).toBe(TERMINAL_ID);
+    expect(hatch.node.id).toBe(GRAPH.goal.nodeId);
     expect(hatch.coverable).toBe(false);
     expect(hatch.providers).toEqual([]);
     expect(hatch.reason).toMatch(/chronic/i);

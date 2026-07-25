@@ -1,6 +1,14 @@
 /** Pure, client-safe helpers for the Critical Path UI and dormant vitals chart. */
 
-import type { Extraction, VitalMetric } from "@/lib/pipeline/types";
+import type {
+  Extraction,
+  GraphNode,
+  NoStallReason,
+  PathwayGoal,
+  PathwayGraph,
+  Stall,
+  VitalMetric,
+} from "@/lib/pipeline/types";
 
 /** Earliest written date across the letters — the pathway start for vitals. */
 export function pathwayStartDate(docs: Extraction[]): string | null {
@@ -15,6 +23,92 @@ export function formatDate(iso: string | null): string {
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
 }
+
+// ---------------------------------------------------------------------------
+// Pathway shaping — what the chain is, where it currently sits, what is noise.
+// ---------------------------------------------------------------------------
+
+/** Statuses that mean a step is finished rather than outstanding. */
+const SETTLED = new Set(["reported", "done", "actioned"]);
+
+export function isSettled(node: GraphNode): boolean {
+  return SETTLED.has(node.status);
+}
+
+export interface PathwayView {
+  /** Ordered referral → clinic → investigations → goal. */
+  chain: GraphNode[];
+  /** Everything mentioned in the letters that is not on the path to the goal. */
+  others: GraphNode[];
+  goal: PathwayGoal | null;
+  /** Where the pathway currently sits — the stalled step, or the first open one. */
+  current: GraphNode | null;
+}
+
+/**
+ * Turn a graph into the shape the panel renders.
+ *
+ * `goal` and `chainIds` are required on PathwayGraph and computed by
+ * lib/pipeline/graph.ts, so the chain is read straight off the API rather than
+ * re-derived here — the backend is the single source of truth for what is on
+ * the path to the goal.
+ */
+export function buildPathwayView(graph: PathwayGraph | null, stall: Stall | null): PathwayView {
+  if (!graph) return { chain: [], others: [], goal: null, current: null };
+  const byId = new Map(graph.nodes.map((node) => [node.id, node]));
+
+  const chain = graph.chainIds
+    .map((id) => byId.get(id))
+    .filter((node): node is GraphNode => Boolean(node));
+
+  // The stall's own chain runs from the stalled node down to the goal, so
+  // anything it names that chainIds missed is appended rather than dropped.
+  const seen = new Set(chain.map((node) => node.id));
+  for (const node of stall?.chain ?? []) {
+    if (!seen.has(node.id)) {
+      chain.push(byId.get(node.id) ?? node);
+      seen.add(node.id);
+    }
+  }
+
+  const current =
+    (stall && (byId.get(stall.stalledNode.id) ?? stall.stalledNode)) ??
+    chain.find((node) => !isSettled(node)) ??
+    chain[chain.length - 1] ??
+    null;
+
+  const others = graph.nodes
+    .filter((node) => !seen.has(node.id))
+    .sort((a, b) => (nodeDate(a) ?? "").localeCompare(nodeDate(b) ?? ""));
+
+  return { chain, others, goal: graph.goal, current };
+}
+
+function nodeDate(node: GraphNode): string | null {
+  return node.report_date ?? node.ordered_date;
+}
+
+/**
+ * Headline for the no-stall panel — never a bare node count. Codes are the
+ * ones lib/pipeline/graph.ts `explainNoStall` actually emits; the reason's own
+ * `message` carries the detail underneath.
+ */
+export function noStallHeadline(reason: NoStallReason | null): string {
+  switch (reason?.code) {
+    case "no_dated_nodes":
+      return "No dated steps to time";
+    case "no_path_to_goal":
+      return "Nothing open connects to your goal";
+    case "nothing_overdue":
+      return "Nothing is past its expected window yet";
+    default:
+      return "No overdue step found";
+  }
+}
+
+/** Fallback copy when the API hasn't sent a reason (older server, or an older cached response). */
+export const NO_STALL_FALLBACK =
+  "Every open step in these letters is still inside the window we'd expect it to take. Nothing here needs chasing today.";
 
 // ---------------------------------------------------------------------------
 // Vitals — retained as an orthogonal, client-side chart helper.

@@ -11,6 +11,7 @@ import type {
   Coverage,
   EscapeHatch,
   Extraction,
+  NoStallReason,
   PathwayGraph,
   Stall,
   VitalsResult,
@@ -96,6 +97,11 @@ export interface GraphResult {
   stall: Stall | null;
   /** Null unless coverage was supplied and the stalled node is coverable. */
   escapeHatch: EscapeHatch | null;
+  /**
+   * Why no stall was reported. Only meaningful when `stall` is null, and
+   * absent on servers that predate it — the UI falls back to its own copy.
+   */
+  noStallReason: NoStallReason | null;
 }
 
 /**
@@ -134,6 +140,7 @@ export async function computeGraph(
     graph: body.graph as PathwayGraph,
     stall: body.stall as Stall | null,
     escapeHatch: (body.escapeHatch ?? null) as EscapeHatch | null,
+    noStallReason: (body.noStallReason ?? null) as NoStallReason | null,
   };
 }
 
