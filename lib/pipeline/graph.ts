@@ -298,8 +298,17 @@ interface PromisedStep {
  * and only by a later letter that put something DIFFERENT in front of the same
  * goal. A step nobody ever placed there is untouched, and whatever the most
  * recent letter named is exactly what stays open.
+ *
+ * A step the letters place UPSTREAM of something still being waited on is not
+ * superseded either — it is the reason that thing is still being waited on. A
+ * repeat CT that a letter says the clearance depends on is not moved past by a
+ * later letter saying the treatment depends on the clearance; they are the same
+ * statement, one link further along.
  */
-function closeSupersededBlockers(blockers: Array<{ node: GraphNode; letterDate: string | null }>) {
+function closeSupersededBlockers(
+  blockers: Array<{ node: GraphNode; letterDate: string | null }>,
+  edges: GraphEdge[],
+) {
   const latest = blockers.reduce<string | null>(
     (newest, entry) => (entry.letterDate && (!newest || entry.letterDate > newest) ? entry.letterDate : newest),
     null,
@@ -308,9 +317,28 @@ function closeSupersededBlockers(blockers: Array<{ node: GraphNode; letterDate: 
   const stillNamed = new Set(
     blockers.filter((entry) => entry.letterDate === latest).map((entry) => entry.node.id),
   );
+
+  /** Whether this step leads, along stated links, to anything still waited on. */
+  const feedsStillNamed = (start: GraphNode): boolean => {
+    const seen = new Set([start.id]);
+    const queue = [start.id];
+    while (queue.length) {
+      const current = queue.shift()!;
+      for (const edge of edges) {
+        if (edge.from !== current || seen.has(edge.to)) continue;
+        if (stillNamed.has(edge.to)) return true;
+        seen.add(edge.to);
+        queue.push(edge.to);
+      }
+    }
+    return false;
+  };
+
   for (const { node, letterDate } of blockers) {
     if (stillNamed.has(node.id) || COMPLETED.has(node.status)) continue;
-    if (letterDate && letterDate < latest) node.status = "actioned";
+    if (!letterDate || letterDate >= latest) continue;
+    if (feedsStillNamed(node)) continue;
+    node.status = "actioned";
   }
 }
 
@@ -391,6 +419,23 @@ function makeNode(input: {
     dueDate: null,
     overdue: null,
   };
+}
+
+/** Whether the stated links already lead from one step to another. */
+function reaches(edges: GraphEdge[], fromId: string, toId: string): boolean {
+  if (fromId === toId) return true;
+  const seen = new Set([fromId]);
+  const queue = [fromId];
+  while (queue.length) {
+    const current = queue.shift()!;
+    for (const edge of edges) {
+      if (edge.from !== current || seen.has(edge.to)) continue;
+      if (edge.to === toId) return true;
+      seen.add(edge.to);
+      queue.push(edge.to);
+    }
+  }
+  return false;
 }
 
 function addEdge(
@@ -955,11 +1000,16 @@ export function buildGraph(extractions: Extraction[], asOf = todayISO()): Pathwa
   // as holding anything up, which is exactly the item most worth chasing.
   for (const { node, statedGoal, letterDate } of promised) {
     const toward = (statedGoal && findNode(nodes, statedGoal, { preferOpen: true })) || goalNode;
+    // Only where the letters left the step unconnected. A step already routed to
+    // the goal through stated dependencies has a route with the intermediate
+    // steps ON it, and adding a direct link would give the shortest path a
+    // shortcut past exactly the steps that explain why it matters.
+    if (reaches(edges, node.id, toward.id)) continue;
     addEdge(edges, node, toward, "blocks");
     if (toward.id === goalNode.id) statedGoalBlockers.push({ node, letterDate });
   }
 
-  closeSupersededBlockers(statedGoalBlockers);
+  closeSupersededBlockers(statedGoalBlockers, edges);
 
   // After the promised appointments exist, so a review the letters commit to is
   // closed by the same evidence that closes a referral.
@@ -1154,11 +1204,33 @@ function overdueBy(node: GraphNode, asOf: string): number | null {
   return asOf > node.dueDate ? daysBetween(node.dueDate, asOf) : null;
 }
 
-/** Every open step now past its due date, most overdue first. */
+/**
+ * How long an open step has been waiting beyond what should have taken.
+ *
+ * A stated due date is a promise and takes precedence. Where the letters promise
+ * nothing, the generic expected wait for that kind of step is used instead —
+ * because a pathway whose letters never wrote an interval down still stalls, and
+ * refusing to name a bottleneck in that case reports "nothing is wrong" about a
+ * referral nobody has answered in three months. The distinction is not lost:
+ * only a stated promise ever sets `node.overdue`, so nothing is shown to a
+ * patient as late against a deadline no clinic agreed to, and a stall on a
+ * generic wait says as much in its own words.
+ */
+function lateBy(node: GraphNode, asOf: string): number | null {
+  const stated = overdueBy(node, asOf);
+  if (stated !== null) return stated;
+  if (COMPLETED.has(node.status) || node.dueDate) return null;
+  const since = startDate(node);
+  if (!since || node.expected_days === null) return null;
+  const waited = daysBetween(since, asOf);
+  return waited > node.expected_days ? waited - node.expected_days : null;
+}
+
+/** Every open step now past what it should have taken, longest waiting first. */
 function overdueNodes(graph: PathwayGraph, asOf: string): GraphNode[] {
   return graph.nodes
-    .filter((node) => node.id !== graph.goal.nodeId && overdueBy(node, asOf) !== null)
-    .sort((a, b) => (overdueBy(b, asOf) ?? 0) - (overdueBy(a, asOf) ?? 0));
+    .filter((node) => node.id !== graph.goal.nodeId && lateBy(node, asOf) !== null)
+    .sort((a, b) => (lateBy(b, asOf) ?? 0) - (lateBy(a, asOf) ?? 0));
 }
 
 /**
@@ -1184,7 +1256,7 @@ export function findStall(graph: PathwayGraph, asOf = todayISO()): Stall | null 
     .map((node) => ({
       node,
       route: stated ? bestPath(graph, node) : { path: [node, goalNode] },
-      days: overdueBy(node, asOf) ?? 0,
+      days: lateBy(node, asOf) ?? 0,
     }))
     .filter((entry): entry is { node: GraphNode; route: { path: GraphNode[] }; days: number } =>
       entry.route !== null,
@@ -1192,6 +1264,13 @@ export function findStall(graph: PathwayGraph, asOf = todayISO()): Stall | null 
   if (!candidates.length) return null;
 
   const ranked = [...candidates].sort((a, b) => {
+    // A promise the clinic actually made outranks an average nobody agreed to,
+    // however long the average has been exceeded. A referral quietly sitting
+    // past its typical wait since January is not a worse breach than a culture
+    // result the TB clinic committed to a date for and has not delivered.
+    const promisedA = Number(Boolean(a.node.dueDate));
+    const promisedB = Number(Boolean(b.node.dueDate));
+    if (promisedA !== promisedB) return promisedB - promisedA;
     if (a.days !== b.days) return b.days - a.days;
     // Same lateness: the one promised earliest is the one that has been waited
     // on longest, so it is the one to chase.
@@ -1202,7 +1281,11 @@ export function findStall(graph: PathwayGraph, asOf = todayISO()): Stall | null 
   const { node: root, route, days: daysOverdue } = ranked[0];
 
   const sinceDate = startDate(root);
-  const alsoOpen = overdue.filter((node) => node.id !== root.id);
+  // Named alongside the bottleneck: only the other steps with a date the letters
+  // actually promised. Everything merely past a typical wait belongs on the
+  // timeline, not in a sentence telling a patient what is late — that list runs
+  // to every referral in the file and says nothing.
+  const alsoOpen = overdue.filter((node) => node.id !== root.id && node.overdue);
   const owner = root.dept || graph.goal.dept;
   const explanation =
     `${graph.goal.label} cannot go ahead until ${root.label} is resolved.` +
@@ -1242,7 +1325,7 @@ export function explainNoStall(graph: PathwayGraph, asOf = todayISO()): NoStallR
       message: "Every step the letters name is complete — nothing is outstanding.",
     };
   }
-  const late = open.filter((node) => overdueBy(node, asOf) !== null);
+  const late = open.filter((node) => lateBy(node, asOf) !== null);
   if (late.length && !late.some((node) => pathToGoal(graph, node) !== null)) {
     return {
       code: "no_path_to_goal",
