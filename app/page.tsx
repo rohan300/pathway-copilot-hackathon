@@ -7,6 +7,7 @@ import type {
   DraftTarget,
   EscapeHatch,
   Extraction,
+  NoStallReason,
   PathwayGraph,
   Stall,
   VitalsResult,
@@ -53,6 +54,9 @@ export default function Home() {
   const [docs, setDocs] = useState<Array<Extraction & { id: string; source: string }>>([]);
   const [graph, setGraph] = useState<PathwayGraph | null>(null);
   const [stall, setStall] = useState<Stall | null>(null);
+  // Only read when `stall` is null — the API's own account of why nothing is
+  // overdue, so the panel never falls back to reporting a bare node count.
+  const [noStallReason, setNoStallReason] = useState<NoStallReason | null>(null);
   // Declared client-side only, never persisted, and defaulted to no cover so
   // the escalation-only path is what shows first.
   const [coverage, setCoverage] = useState<Coverage>(NO_COVER);
@@ -103,6 +107,7 @@ export default function Home() {
       setDocs(nextDocs);
       setGraph(nextResult.graph);
       setStall(nextResult.stall);
+      setNoStallReason(nextResult.noStallReason);
       setEscapeHatch(nextResult.escapeHatch);
       setStartDate(samples.startDate);
       setCsvText(samples.fitbitCsv);
@@ -138,6 +143,7 @@ export default function Home() {
       setDocs(nextDocs);
       setGraph(nextResult.graph);
       setStall(nextResult.stall);
+      setNoStallReason(nextResult.noStallReason);
       setEscapeHatch(nextResult.escapeHatch);
       setStartDate(start);
 
@@ -170,6 +176,7 @@ export default function Home() {
       const nextResult = await computeGraph(docs, undefined, coverageForRequest(next));
       setGraph(nextResult.graph);
       setStall(nextResult.stall);
+      setNoStallReason(nextResult.noStallReason);
       setEscapeHatch(nextResult.escapeHatch);
     } catch (e) {
       setEscapeHatch(null);
@@ -276,6 +283,7 @@ export default function Home() {
         <PathwayPanel
           graph={graph}
           stall={stall}
+          noStallReason={noStallReason}
           loading={busy && !hasData}
           error={error}
           hasData={hasData}
