@@ -94,6 +94,7 @@ Return STRICT JSON only — no prose and no markdown fences. Use exactly this sc
   "referrals": [{"from_dept": string | null, "to_dept": string | null, "reason": string | null, "date": "YYYY-MM-DD" | null}],
   "dependencies": [{"blocked_item": string, "blocking_item": string, "stated_status": string | null}],
   "mdt": [{"date": "YYYY-MM-DD" | null, "outcome": string | null, "awaiting": string | null}],
+  "stated_goal": string | null,
   "confidence": number
 }
 
@@ -104,6 +105,7 @@ Rules:
 - Use a short slug for each investigation id, unique within this letter.
 - A finding may name the investigation it appears on and the next investigation it spawned; otherwise use null.
 - A dependency is the explicit relationship in wording such as “awaiting X before Y”.
+- stated_goal: the treatment or decision THIS letter says the pathway is working toward, in the letter's own words and as a short phrase — for example "Start filgotinib", "Approve infliximab funding". Use null when this letter states no such intent. NAME it only: never say whether it has happened, how far along it is, or what is delaying it.
 - Do not diagnose, interpret, prioritize, or decide urgency. Lower confidence rather than guessing.`;
 
 function isISODate(value: unknown): value is string {
@@ -125,16 +127,22 @@ function slug(value: string): string {
 }
 
 function normalizeType(value: unknown, name = ""): InvestigationType {
-  const text = `${typeof value === "string" ? value : ""} ${name}`.toLowerCase();
+  // The model is instructed to emit the normalized enum. Trust a recognized
+  // explicit value; inferring from the name can create false positives (for
+  // example, "TB-screening chest X-ray" contains "screening").
+  if (INVESTIGATION_TYPES.includes(value as InvestigationType) && value !== "other") {
+    return value as InvestigationType;
+  }
+
+  // Only recover from an omitted, invalid, or generic "other" type.
+  const text = name.toLowerCase();
   if (/bronch/.test(text)) return "bronchoscopy";
   if (/\bct\b|computed tomography/.test(text)) return "ct";
   if (/\bmri\b|magnetic resonance/.test(text)) return "mri";
   if (/consult|clearance|review/.test(text)) return "consult";
   if (/blood|\bigra\b|screening/.test(text)) return "bloods";
   if (/x[- ]?ray|radiograph/.test(text)) return "xray";
-  return INVESTIGATION_TYPES.includes(value as InvestigationType)
-    ? (value as InvestigationType)
-    : "other";
+  return "other";
 }
 
 function normalize(raw: unknown): Extraction {
@@ -209,6 +217,7 @@ function normalize(raw: unknown): Extraction {
     referrals,
     dependencies,
     mdt,
+    stated_goal: nullableString(o.stated_goal),
     confidence: Math.max(0, Math.min(1, confidence)),
   };
 }
