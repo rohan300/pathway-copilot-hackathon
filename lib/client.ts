@@ -8,6 +8,8 @@
  * { vitals }, { draft }); this client unwraps them so callers get plain values.
  */
 import type {
+  Coverage,
+  EscapeHatch,
   Extraction,
   PathwayGraph,
   Stall,
@@ -89,17 +91,33 @@ export async function extractUpload(input: {
   return unwrap<Extraction>(res, "extraction");
 }
 
-/** Build the deterministic dependency graph and identify its stall. */
+export interface GraphResult {
+  graph: PathwayGraph;
+  stall: Stall | null;
+  /** Null unless coverage was supplied and the stalled node is coverable. */
+  escapeHatch: EscapeHatch | null;
+}
+
+/**
+ * Build the deterministic dependency graph and identify its stall.
+ *
+ * `coverage` is optional: pass the user's declared private cover to also get
+ * back the escape hatch for the stalled node. Omit it (the default) and the
+ * request is identical to a pre-coverage one — escalation only.
+ */
 export async function computeGraph(
   extractions: Extraction[],
   asOf?: string,
-): Promise<{ graph: PathwayGraph; stall: Stall | null }> {
+  coverage?: Coverage | null,
+): Promise<GraphResult> {
   const res = await fetch(ROUTES.graph, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ extractions, asOf }),
+    // Absent coverage is omitted rather than sent as null, so the no-cover
+    // request body stays exactly what it was before this route grew the field.
+    body: JSON.stringify({ extractions, asOf, ...(coverage ? { coverage } : {}) }),
   });
-  // Two keys in one payload, so unwrap() (single-key) does not apply; the
+  // Several keys in one payload, so unwrap() (single-key) does not apply; the
   // error handling has to match it explicitly.
   if (!res.ok) {
     let detail = res.statusText;
@@ -112,7 +130,11 @@ export async function computeGraph(
     throw new ApiError(detail || `Request failed (${res.status})`, res.status);
   }
   const body = await res.json();
-  return { graph: body.graph as PathwayGraph, stall: body.stall as Stall | null };
+  return {
+    graph: body.graph as PathwayGraph,
+    stall: body.stall as Stall | null,
+    escapeHatch: (body.escapeHatch ?? null) as EscapeHatch | null,
+  };
 }
 
 /** Join a Fitbit CSV against the pathway start date. Deltas only. */

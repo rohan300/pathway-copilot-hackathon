@@ -2,8 +2,10 @@
 
 import { useEffect, useState } from "react";
 import type {
+  Coverage,
   DraftResult,
   DraftTarget,
+  EscapeHatch,
   Extraction,
   PathwayGraph,
   Stall,
@@ -23,12 +25,21 @@ import {
   type CsvPoint,
 } from "@/lib/view";
 import AppHeader from "./components/AppHeader";
+import CoverageControl, { NO_COVER, hasCover } from "./components/CoverageControl";
 import PathwayPanel from "./components/PathwayPanel";
 import VitalsPanel from "./components/VitalsPanel";
 import DraftPanel from "./components/DraftPanel";
 
 function errMsg(e: unknown, fallback: string): string {
   return e instanceof Error && e.message ? e.message : fallback;
+}
+
+/**
+ * Only send coverage once it actually covers something, so the default
+ * (no cover declared) leaves the graph request exactly as it was before D.
+ */
+function coverageForRequest(c: Coverage): Coverage | null {
+  return hasCover(c) ? c : null;
 }
 
 /**
@@ -41,6 +52,10 @@ export default function Home() {
   const [docs, setDocs] = useState<Array<Extraction & { id: string; source: string }>>([]);
   const [graph, setGraph] = useState<PathwayGraph | null>(null);
   const [stall, setStall] = useState<Stall | null>(null);
+  // Declared client-side only, never persisted, and defaulted to no cover so
+  // the escalation-only path is what shows first.
+  const [coverage, setCoverage] = useState<Coverage>(NO_COVER);
+  const [escapeHatch, setEscapeHatch] = useState<EscapeHatch | null>(null);
   const [vitals, setVitals] = useState<VitalsResult | null>(null);
   const [series, setSeries] = useState<CsvPoint[]>([]);
   const [csvText, setCsvText] = useState<string>("");
@@ -73,12 +88,13 @@ export default function Home() {
         id: samples.letters[i].id,
         source: `${samples.letters[i].title}.pdf`,
       }));
-      const nextResult = await computeGraph(extractions);
+      const nextResult = await computeGraph(extractions, undefined, coverageForRequest(coverage));
       const nextVitals = await joinVitals(samples.fitbitCsv, samples.startDate);
 
       setDocs(nextDocs);
       setGraph(nextResult.graph);
       setStall(nextResult.stall);
+      setEscapeHatch(nextResult.escapeHatch);
       setStartDate(samples.startDate);
       setCsvText(samples.fitbitCsv);
       setSeries(parseCsvSeries(samples.fitbitCsv));
@@ -108,11 +124,12 @@ export default function Home() {
       );
       const nextDocs = [...docs, ...added];
       const start = pathwayStartDate(nextDocs) ?? startDate;
-      const nextResult = await computeGraph(nextDocs);
+      const nextResult = await computeGraph(nextDocs, undefined, coverageForRequest(coverage));
 
       setDocs(nextDocs);
       setGraph(nextResult.graph);
       setStall(nextResult.stall);
+      setEscapeHatch(nextResult.escapeHatch);
       setStartDate(start);
 
       // Re-join vitals against the (possibly new) pathway start.
@@ -121,6 +138,33 @@ export default function Home() {
       }
     } catch (e) {
       setError(errMsg(e, "We couldn't read that letter. Try a clearer photo or PDF."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /**
+   * Declare (or clear) private cover. Client-side only — nothing is persisted.
+   * With letters already loaded the graph is recomputed so the escape hatch
+   * tracks the declaration immediately; the graph and stall themselves are
+   * unaffected by coverage, only the hatch alongside them.
+   */
+  async function changeCoverage(next: Coverage) {
+    setCoverage(next);
+    if (docs.length === 0) {
+      setEscapeHatch(null);
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const nextResult = await computeGraph(docs, undefined, coverageForRequest(next));
+      setGraph(nextResult.graph);
+      setStall(nextResult.stall);
+      setEscapeHatch(nextResult.escapeHatch);
+    } catch (e) {
+      setEscapeHatch(null);
+      setError(errMsg(e, "We couldn't check that cover against your pathway."));
     } finally {
       setBusy(false);
     }
@@ -184,6 +228,13 @@ export default function Home() {
         letterCount={docs.length}
         hasCsv={Boolean(vitals)}
         hasData={hasData}
+      />
+
+      <CoverageControl
+        coverage={coverage}
+        onChange={changeCoverage}
+        escapeHatch={escapeHatch}
+        busy={busy}
       />
 
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-5 px-6 pb-6 md:px-8 lg:grid-cols-3">
