@@ -48,6 +48,13 @@ export interface Extraction {
     stated_status: string | null;
   }[];
   mdt: { date: string | null; outcome: string | null; awaiting: string | null }[];
+  /**
+   * The treatment or decision this letter says the pathway is working toward,
+   * named exactly as the letter names it ("Start filgotinib"). The model may
+   * only NAME it — it never decides what is stalled or how far along we are.
+   * Optional so hand-authored fixtures stay valid; null when nothing is stated.
+   */
+  stated_goal?: string | null;
   /** 0..1. Low confidence is flagged, not guessed. */
   confidence: number;
 }
@@ -82,11 +89,39 @@ export interface GraphEdge {
   from: string;
   to: string;
   kind: EdgeKind;
+  /**
+   * True when the edge comes from the deterministic date-ordered fallback
+   * rather than a dependency the letters state in words. Never LLM-authored.
+   */
+  inferred?: boolean;
+}
+
+/** Where the pathway is trying to get to, always named by the letters. */
+export type PathwayGoalSource =
+  /** A letter states the intent outright (extraction.stated_goal). */
+  | "stated"
+  /** Derived deterministically from what the letters say (dependency terminal, treatment wording). */
+  | "derived"
+  /** No intent anywhere in the letters — the generic placeholder. */
+  | "fallback";
+
+export interface PathwayGoal {
+  nodeId: string;
+  label: string;
+  dept: string | null;
+  source: PathwayGoalSource;
 }
 
 export interface PathwayGraph {
   nodes: GraphNode[];
   edges: GraphEdge[];
+  /** The terminal node of the pathway, inferred from the letters. */
+  goal: PathwayGoal;
+  /**
+   * Ids of the nodes that actually reach the goal, in date order and ending at
+   * the goal. Anything outside this list is an off-chain item the UI demotes.
+   */
+  chainIds: string[];
 }
 
 export interface Stall {
@@ -97,6 +132,21 @@ export interface Stall {
   sinceDate: string | null;
   daysStalled: number;
   expectedDays: number | null;
+}
+
+/** Why there is no stall — "no stall" must never be confused with "not computed". */
+export type NoStallReasonCode =
+  /** Not one step carries a date, so nothing can be timed. */
+  | "no_dated_nodes"
+  /** Open steps exist but none of them connects to the goal. */
+  | "no_path_to_goal"
+  /** Everything open is still inside its expected window. */
+  | "nothing_overdue";
+
+export interface NoStallReason {
+  code: NoStallReasonCode;
+  /** Plain-English sentence the UI can render as-is. */
+  message: string;
 }
 
 // ---------------------------------------------------------------------------
