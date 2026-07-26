@@ -134,10 +134,11 @@ export function formatDayMonth(iso: string): string {
 }
 
 /**
- * How overdue a step is, in plain words. Today this can only be built from the
- * single `Stall` the API returns; GLD-16 adds per-node due dates and a stated
- * `basis`, at which point each entry carries its own. Deliberately reports only
- * what the API computed — a due date is never derived client-side.
+ * How overdue a step is, in plain words. Built from the step's own `overdue`
+ * where the API set one, and from the single `Stall` otherwise — the bottleneck
+ * is still marked when the letters promised no date for it and it is late only
+ * against a typical wait. Deliberately reports only what the API computed: no
+ * due date, day count or lateness is ever derived client-side.
  */
 export interface TimelineOverdue {
   /** Plain-words headline, e.g. "waiting 5 months". */
@@ -209,7 +210,7 @@ export function buildTimeline(view: PathwayView, stall: Stall | null): TimelineV
       date: isDate(date) ? date : null,
       isGoal: node.id === view.goal?.nodeId,
       settled: isSettled(node),
-      overdue: isStalled && stall ? overdueFromStall(stall) : null,
+      overdue: overdueFromNode(node) ?? (isStalled && stall ? overdueFromStall(stall) : null),
       turnaroundDays:
         turnaround !== null && turnaround >= NOTABLE_TURNAROUND_DAYS ? turnaround : null,
     };
@@ -242,6 +243,24 @@ export function timelineSpanLabel(timeline: TimelineView): string | null {
   const range = `${formatDayMonth(first)} – ${formatDate(last)}`;
   const days = daysApart(first, last);
   return days !== null && days >= 14 ? `${range} · ${describeSpan(days)}` : range;
+}
+
+/**
+ * A step against the date the letters actually promised for it (GLD-17 AC2):
+ * "due 21 Jul · 4 days overdue", with the clinic's own words underneath.
+ *
+ * Every number here is read straight off the node — `daysOverdue` is what the
+ * API worked out, and `basis` is the sentence it wrote to explain the date, so
+ * the rail quotes the letters rather than paraphrasing them. A step the letters
+ * never promised a date for carries no `overdue` at all and is not called late.
+ */
+function overdueFromNode(node: GraphNode): TimelineOverdue | null {
+  if (!node.overdue) return null;
+  const late = `${describeSpan(node.overdue.daysOverdue)} overdue`;
+  return {
+    phrase: node.dueDate && isDate(node.dueDate) ? `due ${formatDayMonth(node.dueDate)} · ${late}` : late,
+    detail: node.overdue.basis || null,
+  };
 }
 
 function overdueFromStall(stall: Stall): TimelineOverdue {

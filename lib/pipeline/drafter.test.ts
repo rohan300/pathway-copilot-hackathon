@@ -28,6 +28,9 @@ const APPROVAL_STALL: Stall = {
   sinceDate: "2026-03-20",
   daysStalled: 117,
   expectedDays: 28,
+  dueDate: null,
+  daysOverdue: 89,
+  explanation: "Jak inhibitor approval cannot go ahead until it is resolved.",
 };
 
 const PLAN: Coverage = {

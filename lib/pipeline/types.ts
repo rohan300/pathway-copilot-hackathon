@@ -21,6 +21,27 @@ export type InvestigationStatus =
   | "actioned"
   | "unknown";
 
+/**
+ * A wait the letter promises in words rather than as a calendar date —
+ * "FU 4 weeks", "review in about 6 weeks time", "negative at six weeks". The
+ * model transcribes the phrase; turning it into a due date is deterministic
+ * (see `dueDateFrom` in stateMachine.ts), so an unparseable phrase degrades to
+ * "no stated due date" instead of an invented one.
+ */
+export interface StatedFollowUp {
+  /** What is due, named as the letter names it ("full TB culture", "follow-up"). */
+  item: string;
+  /** The interval exactly as written; null when only an explicit date is given. */
+  phrase: string | null;
+  /**
+   * The event the interval counts from, in the letter's words ("bronchoscopy").
+   * Null means it counts from this letter's date.
+   */
+  from: string | null;
+  /** An explicit due date the letter writes outright. */
+  due_date: string | null;
+}
+
 export interface Extraction {
   /** Written letter date only; never inferred. */
   letter_date: string | null;
@@ -55,6 +76,11 @@ export interface Extraction {
    * Optional so hand-authored fixtures stay valid; null when nothing is stated.
    */
   stated_goal?: string | null;
+  /**
+   * Waits this letter promises in words. Optional so hand-authored fixtures
+   * stay valid; the deterministic layer treats a missing list as "none stated".
+   */
+  follow_ups?: StatedFollowUp[];
   /** 0..1. Low confidence is flagged, not guessed. */
   confidence: number;
 }
@@ -83,17 +109,38 @@ export interface GraphNode {
   ordered_date: string | null;
   report_date: string | null;
   expected_days: number | null;
+  /**
+   * The date this step belongs on a timeline: when it was carried out, else when
+   * it was asked for. Null when no letter dates it at all.
+   */
+  timelineDate: string | null;
+  /**
+   * "written" when a letter gives this step a date of its own; "letter" when the
+   * only date we have is the date of the letter that named it. A step named
+   * without a date is still dated — a letter of 06-Feb asking for a chest X-ray
+   * is evidence the request existed on 06-Feb — but the distinction is kept so
+   * the UI never presents a derived date as a transcribed one.
+   */
+  dateSource: "written" | "letter" | null;
+  /** When the letters promise this step by a date, that date. */
+  dueDate: string | null;
+  /** Set only while this step is open and past a date it should have met. */
+  overdue: NodeOverdue | null;
+}
+
+/**
+ * How late an open step is, and the plain-words reason it counts as late. The
+ * UI renders `basis` verbatim, so it is written the way a clinic would say it.
+ */
+export interface NodeOverdue {
+  daysOverdue: number;
+  basis: string;
 }
 
 export interface GraphEdge {
   from: string;
   to: string;
   kind: EdgeKind;
-  /**
-   * True when the edge comes from the deterministic date-ordered fallback
-   * rather than a dependency the letters state in words. Never LLM-authored.
-   */
-  inferred?: boolean;
 }
 
 /** Where the pathway is trying to get to, always named by the letters. */
@@ -122,6 +169,13 @@ export interface PathwayGraph {
    * the goal. Anything outside this list is an off-chain item the UI demotes.
    */
   chainIds: string[];
+  /**
+   * Whether any letter writes down what blocks what. False means the pathway is
+   * a set of dated steps with no stated dependency between them — real letters
+   * often are — and the graph must not demote a step or claim a route it was
+   * never told about.
+   */
+  statedDependencies: boolean;
 }
 
 export interface Stall {
@@ -132,6 +186,12 @@ export interface Stall {
   sinceDate: string | null;
   daysStalled: number;
   expectedDays: number | null;
+  /** The date the letters promised this by, when they promise one. */
+  dueDate: string | null;
+  /** Days past `dueDate`, or past the generic expected wait when none is stated. */
+  daysOverdue: number;
+  /** Why this blocks the goal and who owns it — renderable as-is. */
+  explanation: string;
 }
 
 /** Why there is no stall — "no stall" must never be confused with "not computed". */

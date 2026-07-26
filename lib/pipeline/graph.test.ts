@@ -24,18 +24,22 @@ describe("buildGraph", () => {
   it("joins the TB chain across both departments and terminates at approval", () => {
     const graph = buildGraph(EXTRACTIONS);
 
+    // The findings the letters report are NOT in this list, and that is the
+    // change: a finding is the join between the step it came off and the step
+    // it caused, not a step of its own. The old expectation listed all three of
+    // them as nodes, which put un-chaseable prose ("CT report requires
+    // bronchoscopy before Respiratory clearance") on the pathway and inserted a
+    // node into the chain between an investigation and what it led to.
     expect(labels(graph.nodes)).toEqual([
       "TB screening bloods",
       "TB-screening chest X-ray",
-      "Incidental pulmonary finding requiring further review",
       "CT chest",
-      "CT report requires bronchoscopy before Respiratory clearance",
       "Respiratory clearance",
       "Bronchoscopy",
-      "Bronchoscopy report requests a repeat CT chest",
       "Repeat CT chest",
       "Jak inhibitor approval",
     ]);
+    expect(graph.nodes.some((node) => node.kind === "finding")).toBe(false);
 
     const terminal = graph.nodes.find((node) => node.id === graph.goal.nodeId);
     expect(terminal).toMatchObject({ kind: "approval", dept: "Gastroenterology", status: "awaiting" });
@@ -57,14 +61,12 @@ describe("buildGraph", () => {
     const graph = buildGraph(EXTRACTIONS);
     const id = (label: string) => graph.nodes.find((node) => node.label === label)!.id;
 
-    // finding.on_investigation -> finding -> finding.spawned
+    // A finding joins the step it was reported on straight to the step it
+    // caused: finding.on_investigation -> finding.spawned. The old assertion
+    // routed this through a node for the finding itself, which is the thing
+    // that is no longer built.
     expect(graph.edges).toContainEqual({
       from: id("TB-screening chest X-ray"),
-      to: id("Incidental pulmonary finding requiring further review"),
-      kind: "spawned_by",
-    });
-    expect(graph.edges).toContainEqual({
-      from: id("Incidental pulmonary finding requiring further review"),
       to: id("CT chest"),
       kind: "spawned_by",
     });
@@ -81,7 +83,9 @@ describe("buildGraph", () => {
       kind: "awaiting",
     });
 
-    // No edge is invented between departments without a stated join.
+    // No edge is invented between departments without a stated join. Happening
+    // earlier is not a dependency: the step is placed on the timeline by its
+    // own date, and nothing claims the next step was waiting on it.
     expect(graph.edges.some((edge) => edge.from === id("TB screening bloods"))).toBe(false);
   });
 });
@@ -345,5 +349,109 @@ describe("explainNoStall", () => {
 
     expect(findStall(disconnected, "2026-07-15")).toBeNull();
     expect(explainNoStall(disconnected, "2026-07-15")).toMatchObject({ code: "no_path_to_goal" });
+  });
+});
+
+/**
+ * The rules that decide when two mentions are one step. Written against
+ * minimal, purpose-built extractions rather than the demo corpus, so each test
+ * states the rule it is protecting instead of blessing a number this particular
+ * set of letters happens to produce.
+ */
+describe("same step, written up twice", () => {
+  const letter = (over: Partial<Extraction>): Extraction => ({
+    letter_date: null,
+    department: "Respiratory",
+    clinicians: [],
+    investigations: [],
+    findings: [],
+    referrals: [],
+    dependencies: [],
+    mdt: [],
+    confidence: 1,
+    ...over,
+  });
+
+  const inv = (
+    name: string,
+    type: Extraction["investigations"][number]["type"],
+    status: Extraction["investigations"][number]["status"],
+    dates: { ordered_date?: string | null; report_date?: string | null } = {},
+  ) => ({
+    id: name,
+    name,
+    type,
+    status,
+    ordered_date: dates.ordered_date ?? null,
+    report_date: dates.report_date ?? null,
+  });
+
+  it("rejoins a step a later letter merely restates, instead of ordering it again", () => {
+    const graph = buildGraph([
+      letter({ letter_date: "2026-03-13", investigations: [inv("chest x-ray", "xray", "done", { report_date: "2026-03-13" })] }),
+      letter({ letter_date: "2026-06-23", investigations: [inv("CXR", "xray", "ordered")] }),
+    ], "2026-07-25");
+
+    const xrays = graph.nodes.filter((node) => node.invType === "xray");
+    expect(labels(xrays)).toEqual(["chest x-ray"]);
+    expect(xrays[0].status).toBe("done");
+    // The June letter recounting a March result must not date the request to
+    // June — that would put the request after its own report.
+    expect(xrays[0].ordered_date).toBeNull();
+  });
+
+  it("keeps a repeat apart from the completed step it repeats", () => {
+    const graph = buildGraph([
+      letter({ letter_date: "2026-04-18", investigations: [inv("CT thorax", "ct", "reported", { report_date: "2026-04-18" })] }),
+      letter({ letter_date: "2026-05-12", investigations: [inv("repeat non-contrast CT scan", "ct", "ordered")] }),
+    ], "2026-07-25");
+
+    const cts = graph.nodes.filter((node) => node.invType === "ct");
+    expect(cts).toHaveLength(2);
+    expect(cts.filter((node) => node.status === "reported")).toHaveLength(1);
+    expect(cts.filter((node) => node.status === "ordered")).toHaveLength(1);
+  });
+
+  it("sends a later plain re-request to the open repeat, not the finished original", () => {
+    const graph = buildGraph([
+      letter({ letter_date: "2026-04-18", investigations: [inv("CT thorax", "ct", "reported", { report_date: "2026-04-18" })] }),
+      letter({ letter_date: "2026-05-12", investigations: [inv("repeat non-contrast CT scan", "ct", "ordered")] }),
+      letter({ letter_date: "2026-06-23", investigations: [inv("CT chest", "ct", "ordered", { ordered_date: "2026-06-23" })] }),
+    ], "2026-07-25");
+
+    const cts = graph.nodes.filter((node) => node.invType === "ct");
+    expect(cts).toHaveLength(2);
+    const done = cts.find((node) => node.status === "reported")!;
+    const open = cts.find((node) => node.status === "ordered")!;
+    // The completed scan keeps its own date; the June re-request belongs to the
+    // repeat that is still outstanding.
+    expect(done.report_date).toBe("2026-04-18");
+    expect(done.ordered_date).toBeNull();
+    expect(open.ordered_date).toBe("2026-05-12");
+  });
+
+  it("does not let a one-letter word in a listed panel split it from the same panel named plainly", () => {
+    const graph = buildGraph([
+      letter({ letter_date: "2026-02-06", investigations: [inv("prebiological screening blood test", "bloods", "ordered")] }),
+      letter({ letter_date: "2026-02-20", investigations: [inv("routine blood tests including tests for Lipids, TB, HIV, Varicella, Hep B, Hep C", "bloods", "ordered")] }),
+    ], "2026-07-25");
+
+    expect(graph.nodes.filter((node) => node.invType === "bloods")).toHaveLength(1);
+  });
+
+  it("makes a finding the join between two steps and never a step itself", () => {
+    const graph = buildGraph([
+      letter({
+        letter_date: "2026-05-01",
+        investigations: [inv("chest x-ray", "xray", "reported"), inv("CT chest", "ct", "ordered")],
+        findings: [{ text: "Right upper zone consolidation", on_investigation: "chest x-ray", spawned: "CT chest" }],
+      }),
+    ], "2026-07-25");
+
+    expect(graph.nodes.some((node) => node.kind === "finding")).toBe(false);
+    expect(graph.nodes.some((node) => /consolidation/i.test(node.label))).toBe(false);
+    const xray = graph.nodes.find((node) => node.invType === "xray")!;
+    const ct = graph.nodes.find((node) => node.invType === "ct")!;
+    expect(graph.edges).toContainEqual({ from: xray.id, to: ct.id, kind: "spawned_by" });
   });
 });

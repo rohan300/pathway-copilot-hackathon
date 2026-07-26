@@ -6,7 +6,15 @@ export type { ExtractInput, LetterImage } from "./extractor";
 export { buildGraph, findStall, explainNoStall } from "./graph";
 export { escapeHatch } from "./coverage";
 export { PRIVATE_PROVIDERS, providersFor } from "./providers";
-export { EXPECTED_MAX_DAYS, parseDate, daysBetween, todayISO } from "./stateMachine";
+export {
+  EXPECTED_MAX_DAYS,
+  parseDate,
+  daysBetween,
+  todayISO,
+  addDays,
+  parseIntervalDays,
+  dueDateFrom,
+} from "./stateMachine";
 export { joinVitals, parseFitbitCsv } from "./vitals";
 export { draft } from "./drafter";
 export {
