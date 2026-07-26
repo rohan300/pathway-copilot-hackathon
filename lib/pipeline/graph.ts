@@ -563,6 +563,54 @@ function byLetterDate(extractions: Extraction[]): Extraction[] {
 }
 
 /**
+ * Which of the named goals the letters put on the way to another named goal.
+ *
+ * Clearing a patient for a treatment is not a rival destination to the
+ * treatment — it is the step before it, and the letters say so themselves. So
+ * the question asked of each candidate is only ever about the OTHER candidates:
+ * does anything the letters state make this a precondition of another thing
+ * somebody called the goal? The route is followed all the way through, because
+ * the letter that links the two rarely names them in the same breath — one says
+ * the culture blocks the clearance, another says the clearance blocks the drug.
+ *
+ * Deliberately restricted to candidate-to-candidate: reading EVERY stated
+ * dependency this way meant one letter mentioning a funding application after
+ * the drug demoted the drug out of the running, and a clearance nobody had
+ * linked to anything inherited the pathway.
+ */
+function goalsLeadingToAnother(ordered: Extraction[], candidates: Set<string>): Set<string> {
+  /** blocking step -> everything the letters say waits on it. */
+  const leadsTo = new Map<string, Set<string>>();
+  for (const extraction of ordered) {
+    for (const dependency of extraction.dependencies) {
+      const from = intentKey(dependency.blocking_item);
+      const to = intentKey(dependency.blocked_item);
+      if (!from || !to || from === to) continue;
+      const seen = leadsTo.get(from) ?? new Set<string>();
+      seen.add(to);
+      leadsTo.set(from, seen);
+    }
+  }
+
+  const upstream = new Set<string>();
+  for (const candidate of candidates) {
+    const seen = new Set<string>([candidate]);
+    const queue = [...(leadsTo.get(candidate) ?? [])];
+    while (queue.length) {
+      const step = queue.pop()!;
+      if (seen.has(step)) continue;
+      seen.add(step);
+      if (candidates.has(step)) {
+        upstream.add(candidate);
+        break;
+      }
+      queue.push(...(leadsTo.get(step) ?? []));
+    }
+  }
+  return upstream;
+}
+
+/**
  * The goal is whatever the LETTERS are working toward — never a hardcoded
  * label. The model only ever supplies the NAME; which name wins is decided
  * here, deterministically.
@@ -571,9 +619,10 @@ function byLetterDate(extractions: Extraction[]): Extraction[] {
  * whichever department happened to write last. On a cross-department pathway
  * that is exactly wrong: the respiratory team's "clear him for his UC
  * treatment" is a step toward the gastro team's treatment, not the destination.
- * So goals are grouped by what they actually name, and the group that the most
- * letters work toward wins, with the letters' stated dependencies breaking ties
- * in favour of something nothing else is waiting on.
+ * So goals are grouped by what they actually name, and the destination is the
+ * one the letters put nothing else after: the candidate that is not a
+ * precondition of another candidate. Where they are genuinely unrelated, the
+ * one the most letters work toward wins.
  */
 function inferGoal(ordered: Extraction[]): { label: string; dept: string | null; source: PathwayGoal["source"] } {
   const blockingKeys = new Set(
@@ -600,14 +649,18 @@ function inferGoal(ordered: Extraction[]): { label: string; dept: string | null;
   }
 
   if (groups.size) {
+    const upstream = goalsLeadingToAnother(ordered, new Set(groups.keys()));
     const ranked = [...groups.entries()].sort(([keyA, a], [keyB, b]) => {
-      // Something the letters say is itself blocking something else is a step,
-      // not the destination.
-      const terminalA = Number(!blockingKeys.has(keyA));
-      const terminalB = Number(!blockingKeys.has(keyB));
+      // A goal the letters put before another goal is a step on the way to it.
+      const terminalA = Number(!upstream.has(keyA));
+      const terminalB = Number(!upstream.has(keyB));
       if (terminalA !== terminalB) return terminalB - terminalA;
+      // Nothing states a route between them, so the destination is the one the
+      // pathway is mostly about: the intent the most letters name.
       if (a.letters !== b.letters) return b.letters - a.letters;
-      return a.label.length - b.label.length;
+      if (a.label.length !== b.label.length) return a.label.length - b.label.length;
+      // Last resort, so the same letters in any order give the same goal.
+      return keyA < keyB ? -1 : 1;
     });
     const [, winner] = ranked[0];
     return { label: sentenceCase(winner.label), dept: winner.dept, source: "stated" };
