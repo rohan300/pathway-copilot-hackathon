@@ -456,6 +456,115 @@ describe("same step, written up twice", () => {
   });
 });
 
+describe("two letters, two stated goals", () => {
+  const letter = (over: Partial<Extraction>): Extraction => ({
+    letter_date: null,
+    department: "Respiratory Medicine",
+    clinicians: [],
+    investigations: [],
+    findings: [],
+    referrals: [],
+    dependencies: [],
+    mdt: [],
+    confidence: 1,
+    ...over,
+  });
+
+  it("puts the goal that another goal waits on before it, not instead of it", () => {
+    // Two teams, each naming what IT is working toward. The clearance is stated
+    // by the letter that also states the drug waits on it, so it is a step on
+    // the way — even though it is the later letter and the last word.
+    const extractions = [
+      letter({
+        letter_date: "2026-05-12",
+        department: "Gastroenterology",
+        stated_goal: "start filgotinib",
+      }),
+      letter({
+        letter_date: "2026-06-23",
+        stated_goal: "clear him for his UC treatment",
+        dependencies: [{ blocked_item: "start filgotinib", blocking_item: "clear him for his UC treatment", stated_status: null }],
+      }),
+    ];
+
+    expect(buildGraph(extractions, "2026-07-25").goal).toMatchObject({
+      label: "Start filgotinib",
+      dept: "Gastroenterology",
+      source: "stated",
+    });
+  });
+
+  it("follows the route through the steps between the two goals", () => {
+    // Nothing names the two goals in one breath: one letter says the screen
+    // gates the eligibility decision, another says the decision gates the
+    // treatment. The destination is still the treatment.
+    const extractions = [
+      letter({
+        letter_date: "2026-03-02",
+        department: "Cardiology",
+        stated_goal: "confirm he is fit for ablation",
+        dependencies: [{ blocked_item: "confirm he is fit for ablation", blocking_item: "echocardiogram", stated_status: null }],
+      }),
+      letter({
+        letter_date: "2026-04-14",
+        department: "Electrophysiology",
+        stated_goal: "proceed to catheter ablation",
+        dependencies: [{ blocked_item: "proceed to catheter ablation", blocking_item: "confirm he is fit for ablation", stated_status: null }],
+      }),
+    ];
+
+    expect(buildGraph(extractions, "2026-07-25").goal.label).toBe("Proceed to catheter ablation");
+  });
+
+  it("takes a clearance as the goal when it is the only goal stated", () => {
+    // Nothing else is named, so there is nothing for it to be a step toward.
+    const graph = buildGraph([
+      letter({
+        letter_date: "2026-06-23",
+        stated_goal: "clear him for his UC treatment",
+        dependencies: [{ blocked_item: "clear him for his UC treatment", blocking_item: "full TB culture results", stated_status: null }],
+      }),
+    ], "2026-07-25");
+
+    expect(graph.goal).toMatchObject({
+      label: "Clear him for his UC treatment",
+      dept: "Respiratory Medicine",
+      source: "stated",
+    });
+  });
+
+  it("gives unrelated goals to the one the most letters name, whatever order they arrive in", () => {
+    // No letter states a route between them, so the pathway is decided by what
+    // it is mostly about — and the same letters shuffled give the same answer.
+    const extractions = [
+      letter({ letter_date: "2026-01-12", department: "Gastroenterology", stated_goal: "start filgotinib" }),
+      letter({ letter_date: "2026-02-06", department: "Gastroenterology", stated_goal: "start him on filgotinib" }),
+      letter({ letter_date: "2026-06-23", stated_goal: "apply for funding" }),
+    ];
+
+    expect(buildGraph(extractions, "2026-07-25").goal.label).toBe("Start filgotinib");
+    expect(buildGraph([...extractions].reverse(), "2026-07-25").goal.label).toBe("Start filgotinib");
+  });
+
+  it("does not demote a goal because a letter names something after it", () => {
+    // "Apply for funding once filgotinib is agreed" is one letter's aside, not a
+    // rival destination. Judging every stated dependency instead of only the
+    // ones between named goals let that aside hand the pathway to a clearance
+    // nobody had linked to anything.
+    const extractions = [
+      letter({
+        letter_date: "2026-02-06",
+        department: "Gastroenterology",
+        stated_goal: "start filgotinib",
+        dependencies: [{ blocked_item: "apply for funding", blocking_item: "start filgotinib", stated_status: null }],
+      }),
+      letter({ letter_date: "2026-06-23", stated_goal: "clear him for his UC treatment" }),
+    ];
+
+    expect(buildGraph(extractions, "2026-07-25").goal.label).toBe("Start filgotinib");
+  });
+});
+
 describe("a promise the letters make", () => {
   const letter = (over: Partial<Extraction>): Extraction => ({
     letter_date: null,
