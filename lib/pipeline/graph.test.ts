@@ -455,3 +455,124 @@ describe("same step, written up twice", () => {
     expect(graph.edges).toContainEqual({ from: xray.id, to: ct.id, kind: "spawned_by" });
   });
 });
+
+describe("a promise the letters make", () => {
+  const letter = (over: Partial<Extraction>): Extraction => ({
+    letter_date: null,
+    department: "Respiratory Medicine",
+    clinicians: [],
+    investigations: [],
+    findings: [],
+    referrals: [],
+    dependencies: [],
+    mdt: [],
+    confidence: 1,
+    ...over,
+  });
+
+  const promise = (item: string, phrase: string | null, due_date: string | null = null) => ({
+    item,
+    phrase,
+    from: null,
+    due_date,
+  });
+
+  /** The 23-Jun letter's "FU 4 weeks", transcribed the way the extractor writes it. */
+  const JUN_FU = letter({
+    letter_date: "2026-06-23",
+    follow_ups: [promise("FU", "4 weeks")],
+  });
+
+  it("turns a promise with no step of its own into a step that can run late", () => {
+    const graph = buildGraph([JUN_FU], "2026-07-25");
+
+    const followUp = graph.nodes.find((node) => /follow.?up/i.test(node.label))!;
+    expect(followUp.dueDate).toBe("2026-07-21");
+    expect(followUp.overdue?.daysOverdue).toBe(4);
+  });
+
+  it("does not hand the next appointment's promise to the one booked for today", () => {
+    // The 20-May letter books a follow-up FOR 23 Jun; the 23-Jun letter IS that
+    // appointment, and it promises another in four weeks. The June promise used
+    // to resolve onto the June appointment and lose to its earlier due date, so
+    // the graph said nothing was late when the only late thing on the pathway
+    // was this. Nothing has written the June clinic up as attended, so it is
+    // still an open step — being spent is about its day having come, not about
+    // its status.
+    const graph = buildGraph([
+      letter({
+        letter_date: "2026-05-20",
+        follow_ups: [promise("follow up in IRIS clinic", "23/06/2026", "2026-06-23")],
+      }),
+      letter({ letter_date: "2026-06-23", follow_ups: [promise("FU", "4 weeks")] }),
+    ], "2026-07-25");
+
+    const booked = graph.nodes.find((node) => /IRIS/i.test(node.label))!;
+    expect(booked.dueDate).toBe("2026-06-23");
+
+    const promised = graph.nodes.find((node) => node.id !== booked.id && /follow.?up/i.test(node.label));
+    expect(promised?.dueDate).toBe("2026-07-21");
+    expect(promised?.overdue?.daysOverdue).toBe(4);
+  });
+
+  it("does not let an appointment already attended keep the promise of the next one", () => {
+    // Same two letters, with the June clinic written up as attended on the day.
+    // A finished step can only be what kept a promise made after it happened.
+    const graph = buildGraph([
+      letter({
+        letter_date: "2026-05-20",
+        follow_ups: [promise("follow up in IRIS clinic", "23/06/2026", "2026-06-23")],
+      }),
+      letter({
+        letter_date: "2026-06-23",
+        investigations: [{
+          id: "iris",
+          name: "follow up in IRIS clinic",
+          type: "consult",
+          status: "actioned",
+          ordered_date: null,
+          report_date: "2026-06-23",
+        }],
+        follow_ups: [promise("FU", "4 weeks")],
+      }),
+    ], "2026-07-25");
+
+    const attended = graph.nodes.find((node) => /IRIS/i.test(node.label))!;
+    expect(attended.status).toBe("actioned");
+    expect(attended.overdue).toBeNull();
+
+    const promised = graph.nodes.find((node) => node.id !== attended.id && /follow.?up/i.test(node.label));
+    expect(promised?.dueDate).toBe("2026-07-21");
+    expect(promised?.overdue?.daysOverdue).toBe(4);
+  });
+
+  it("treats a promise as kept by the step that followed it", () => {
+    // "Chest x-ray next week" on 2 March, reported on 13 March. The x-ray
+    // happened AFTER the letter asked for it, so nothing is outstanding and no
+    // second x-ray is invented.
+    const graph = buildGraph([
+      letter({
+        letter_date: "2026-03-02",
+        department: "Gastroenterology",
+        follow_ups: [promise("chest x-ray", "next week")],
+      }),
+      letter({
+        letter_date: "2026-05-01",
+        investigations: [{
+          id: "cxr",
+          name: "chest x-ray",
+          type: "xray",
+          status: "reported",
+          ordered_date: null,
+          report_date: "2026-03-13",
+        }],
+      }),
+    ], "2026-07-25");
+
+    const xrays = graph.nodes.filter((node) => /x.?ray/i.test(node.label));
+    expect(xrays).toHaveLength(1);
+    expect(xrays[0].status).toBe("reported");
+    expect(xrays[0].dueDate).toBeNull();
+    expect(graph.nodes.every((node) => !node.overdue)).toBe(true);
+  });
+});
