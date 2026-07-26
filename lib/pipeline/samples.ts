@@ -208,9 +208,9 @@ Respiratory procedures team`,
 Clinic letter date: 10 June 2026
 
 Following the bronchoscopy report, a repeat CT chest was ordered on 10 June
-2026. The report has not yet been returned. Respiratory clearance remains open
-awaiting the repeat CT chest, and Gastroenterology's JAK inhibitor approval is
-awaiting that clearance.
+2026, to be carried out and reported within 3 weeks. The report has not yet
+been returned. Respiratory clearance remains open awaiting the repeat CT chest,
+and Gastroenterology's JAK inhibitor approval is awaiting that clearance.
 
 Respiratory bookings team`,
     extraction: {
@@ -242,6 +242,14 @@ Respiratory bookings team`,
         },
       ],
       mdt: [],
+      follow_ups: [
+        {
+          item: "Repeat CT chest",
+          phrase: "3 weeks",
+          from: null,
+          due_date: null,
+        },
+      ],
       confidence: 0.96,
     },
   },
