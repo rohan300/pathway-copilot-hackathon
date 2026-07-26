@@ -13,12 +13,15 @@ import json, glob, subprocess, collections, os
 
 CACHE = os.environ.get("GLD16_CACHE", "/tmp/gld16-extractions")
 AS_OF = os.environ.get("GLD16_AS_OF", "2026-07-25")
+# The app under measurement. Set GLD16_PORT when the dev server for the branch
+# being measured is not the one on the default port.
+PORT = os.environ.get("GLD16_PORT", "3000")
 
 ex = [json.load(open(f))["extraction"] for f in sorted(glob.glob(f"{CACHE}/*.json"))]
 req = "/tmp/gld16-graph-req.json"
 json.dump({"extractions": ex, "asOf": AS_OF}, open(req, "w"))
 out = subprocess.run(
-    ["curl", "-s", "-X", "POST", "http://localhost:3000/api/graph",
+    ["curl", "-s", "-X", "POST", f"http://localhost:{PORT}/api/graph",
      "-H", "content-type: application/json", "-d", f"@{req}"],
     capture_output=True, text=True).stdout
 d = json.loads(out)

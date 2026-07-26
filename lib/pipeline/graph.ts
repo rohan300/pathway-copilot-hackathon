@@ -186,7 +186,10 @@ function stepTokens(name: string, invType: InvestigationType | null): Set<string
   const echo = new Set((invType ? TYPE_ECHO[invType] : []).map(stem));
   const out = new Set<string>();
   for (const raw of name.toLowerCase().split(/[^a-z0-9]+/)) {
-    if (!raw || STOPWORDS.has(raw)) continue;
+    // A one-character word never says which step this is. Letters list panels
+    // as "Hep B, Hep C", and counting the B and the C as identifying tokens
+    // made that list disagree with the same screen named any other way.
+    if (!raw || raw.length < 2 || STOPWORDS.has(raw)) continue;
     const word = stem(SYNONYMS[raw] ?? raw);
     if (!word || STOPWORDS.has(word) || GENERIC_TOKENS.has(word) || ORG_TOKENS.has(word)) continue;
     if (echo.has(word) || echo.has(raw)) continue;
@@ -705,7 +708,6 @@ export function buildGraph(extractions: Extraction[], asOf = todayISO()): Pathwa
   const nodes: GraphNode[] = [];
   const edges: GraphEdge[] = [];
   const sourceFindings: Array<{
-    node: GraphNode;
     on: string | null;
     spawned: string | null;
     /** The naming letter's own investigation ids — an exact reference beats a fuzzy one. */
@@ -750,15 +752,24 @@ export function buildGraph(extractions: Extraction[], asOf = todayISO()): Pathwa
         node.invType === investigation.type &&
         sameStep(tokensById.get(node.id)!, key),
       );
-      // A letter reporting a result fills in the request already on the graph.
-      // A letter still asking for something that the graph shows as DONE is
-      // asking again — a repeat CT after an abnormal one is a new step, not a
-      // completed one reopening. Pathways move forward.
-      const existing = isRepeat
-        ? matches.find((node) => !COMPLETED.has(node.status))
-        : completed
-          ? matches.find((node) => COMPLETED.has(node.status)) ?? matches.find((node) => !COMPLETED.has(node.status))
-          : matches.find((node) => !COMPLETED.has(node.status));
+      const open = matches.find((node) => !COMPLETED.has(node.status));
+      const done = matches.find((node) => COMPLETED.has(node.status));
+      // Stage decides WHICH instance a mention joins; only the letters' own
+      // word for it opens a second one.
+      //
+      // A repeat is a genuinely new step — an 18 Apr CT that was reported and a
+      // repeat CT still outstanding are two things, and collapsing them loses
+      // the whole "it was done, and another is now pending" story. So a repeat
+      // takes the open instance, never the finished one.
+      //
+      // Everything else is the same step being written up again. A later letter
+      // restating a request for something the graph already shows as reported is
+      // recounting history, not ordering it a second time: letters name the same
+      // test at every stage it passes through, and almost none of them write an
+      // order date, so treating each restatement as a fresh request manufactured
+      // a duplicate step per mention. It joins the open instance if one is
+      // running, and otherwise the finished one.
+      const existing = isRepeat ? open : completed ? done ?? open : open ?? done;
 
       // A step named without a date of its own is still evidence of itself on
       // the date of the letter that named it: a 6 Feb letter asking for a chest
@@ -775,8 +786,15 @@ export function buildGraph(extractions: Extraction[], asOf = todayISO()): Pathwa
       if (existing) {
         // Earliest request date, latest known status (a step is asked for once
         // and reported once, however many letters mention it).
-        existing.ordered_date = earliest(existing.ordered_date, orderedDate);
         existing.report_date = earliest(existing.report_date, reportDate);
+        // A date borrowed from the letter that restated a step is not allowed to
+        // claim it was asked for AFTER it was carried out. A June letter listing
+        // a chest X-ray reported in March is recounting it, and dating the
+        // request to June would put the request after its own result.
+        const merged = earliest(existing.ordered_date, orderedDate);
+        if (!(merged && existing.report_date && merged > existing.report_date)) {
+          existing.ordered_date = merged;
+        }
         if (rank(investigation.status) > rank(existing.status)) existing.status = investigation.status;
         if (!derived) existing.dateSource = "written";
         // A fuller name from a later letter still describes the same step.
@@ -821,29 +839,15 @@ export function buildGraph(extractions: Extraction[], asOf = todayISO()): Pathwa
       remember(investigation.id, node);
     }
 
+    // A finding is a RESULT, and a result is not a step anyone can chase. It
+    // belongs to the investigation it came off, and where it caused the next
+    // step it is the join between the two. So a finding is an edge and never a
+    // node: "right upper zone consolidation" is why the repeat CT was asked
+    // for, not a thing sitting in a queue waiting to be done. Making nodes of
+    // them put un-actionable prose on the pathway and, worse, inserted a step
+    // into the chain between the investigation and what it led to.
     for (const finding of extraction.findings) {
-      // Background prose is not a pathway step, and neither is a result: a
-      // result belongs to the investigation it came off. A finding earns a node
-      // only when it JOINS two steps — it caused the next one — or the letters
-      // name it in a dependency.
-      const connective = Boolean(finding.spawned) || dependencyText.has(compact(finding.text));
-      if (!connective) continue;
-      const existing = nodes.find((node) => node.kind === "finding" && compact(node.label) === compact(finding.text));
-      if (existing) {
-        sourceFindings.push({ node: existing, on: finding.on_investigation, spawned: finding.spawned, local: localNodes });
-        continue;
-      }
-      const node = makeNode({
-        id: `finding:${slug(finding.text)}-${nodes.length + 1}`,
-        label: finding.text,
-        dept: extraction.department,
-        kind: "finding",
-        status: "reported",
-        ordered_date: extraction.letter_date,
-        dateSource: "letter",
-      });
-      nodes.push(node);
-      sourceFindings.push({ node, on: finding.on_investigation, spawned: finding.spawned, local: localNodes });
+      sourceFindings.push({ on: finding.on_investigation, spawned: finding.spawned, local: localNodes });
     }
 
     for (const referral of extraction.referrals) {
@@ -914,8 +918,7 @@ export function buildGraph(extractions: Extraction[], asOf = todayISO()): Pathwa
     source: inferred.source,
   };
 
-  // A finding is attached to the investigation on which it was reported and
-  // points to the investigation it spawned. Both edges are factual joins. The
+  // A finding joins the step it was reported on to the step it caused. The
   // reference is resolved against the naming letter's own investigation ids
   // first, since those are exact where a prose match is a guess.
   const resolve = (local: Map<string, GraphNode>, text: string | null) => {
@@ -923,8 +926,7 @@ export function buildGraph(extractions: Extraction[], asOf = todayISO()): Pathwa
     return local.get(text) ?? local.get(text.replace(/-\d+$/, "")) ?? findNode(nodes, text);
   };
   for (const finding of sourceFindings) {
-    addEdge(edges, resolve(finding.local, finding.on), finding.node, "spawned_by");
-    addEdge(edges, finding.node, resolve(finding.local, finding.spawned), "spawned_by");
+    addEdge(edges, resolve(finding.local, finding.on), resolve(finding.local, finding.spawned), "spawned_by");
   }
 
   // Explicit “awaiting X before Y” relationships are stated dependency edges;
@@ -1121,9 +1123,22 @@ function applyFollowUps(
       // separate consult would show the same scan twice.
       const invType = typeFromName(followUp.item);
       const key = stepTokens(label, invType);
+      // "other" is what the namer says when it cannot tell WHICH kind of step
+      // this is — it is not a kind of its own. Filtering on it looked for the
+      // promised step only among the steps we equally failed to classify, so a
+      // promise whose wording we do not recognise could never find the step it
+      // was promising and always invented a second one. Unknown type means the
+      // type does not narrow the search; it does not mean the search is empty.
+      //
+      // With no type to narrow on, the words have to carry the match on their
+      // own, so an overlap is required: an empty token set means "any step of
+      // this type", which without a type would mean any step at all.
+      const unknownType = invType === "other";
       let target = nodes.find((node) =>
-        node.kind === "investigation" && node.invType === invType &&
-        !COMPLETED.has(node.status) && sameStep(tokensById.get(node.id) ?? new Set(), key),
+        node.kind === "investigation" &&
+        (unknownType || node.invType === invType) &&
+        !COMPLETED.has(node.status) &&
+        sameStep(tokensById.get(node.id) ?? new Set(), key, unknownType),
       );
       if (!target) {
         target = makeNode({
