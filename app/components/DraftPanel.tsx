@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import type { DraftResult, DraftTarget } from "@/lib/pipeline/types";
+import type { DraftResult, DraftTarget, Stall } from "@/lib/pipeline/types";
 
 interface Props {
   draft: DraftResult | null;
@@ -10,6 +10,7 @@ interface Props {
   loading: boolean;
   error: string | null;
   hasState: boolean;
+  stall: Stall | null;
 }
 
 const TABS: { value: DraftTarget; label: string; to: string }[] = [
@@ -30,8 +31,13 @@ export default function DraftPanel({
   loading,
   error,
   hasState,
+  stall,
 }: Props) {
   const to = TABS.find((t) => t.value === target)?.to ?? "";
+  const tabLabel = TABS.find((t) => t.value === target)?.label ?? "Pathway";
+  const subject = stall
+    ? `${tabLabel}: ${stall.stalledNode.label} (${stall.daysStalled} days outstanding)`
+    : `${tabLabel} update`;
 
   return (
     <section className="flex min-h-0 flex-col">
@@ -67,7 +73,7 @@ export default function DraftPanel({
             ) : draft.target === "clinician_summary" ? (
               <ClinicianOnePager draft={draft} />
             ) : (
-              <Letter draft={draft} to={to} />
+              <Letter draft={draft} to={to} subject={subject} />
             )}
           </>
         )}
@@ -76,8 +82,17 @@ export default function DraftPanel({
   );
 }
 
-function Letter({ draft, to }: { draft: DraftResult; to: string }) {
+function Letter({
+  draft,
+  to,
+  subject,
+}: {
+  draft: DraftResult;
+  to: string;
+  subject: string;
+}) {
   const paragraphs = draft.text.split(/\n{2,}/).map((p) => p.trim()).filter(Boolean);
+  const mailto = `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(draft.text)}`;
   return (
     <div className="rounded-2xl border border-line bg-card p-6 shadow-card">
       <div className="mb-3.5 text-[12px] text-ink-3">
@@ -97,8 +112,16 @@ function Letter({ draft, to }: { draft: DraftResult; to: string }) {
         Please read it over and change anything before you send it.
       </div>
 
-      <div className="mt-4 flex items-center gap-3">
+      <div className="mt-4 flex flex-wrap items-center gap-3">
         <CopyButton text={draft.text} />
+        <a
+          href={mailto}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="rounded-full border border-line-2 bg-card px-5 py-2.5 text-[13px] font-semibold text-ink-2 transition-colors hover:border-sage hover:text-sage-deep"
+        >
+          Open in email
+        </a>
         <span className="text-[12px] text-ink-3">It&apos;s yours — edit freely</span>
         {draft.mocked && (
           <span className="ml-auto text-[11px] text-ink-3">sample draft</span>
