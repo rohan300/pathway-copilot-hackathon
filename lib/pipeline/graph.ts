@@ -1070,6 +1070,26 @@ interface SourceFollowUp {
 }
 
 /**
+ * Whether `node` can still be the step a letter of `letterDate` is promising,
+ * rather than an earlier occurrence of it that has already had its day.
+ *
+ * A clinic writing "FU 4 weeks" is promising the NEXT appointment — not the one
+ * the patient has just attended, and not the one that was booked for today.
+ * What separates the two is whether the step's own day is still ahead of the
+ * letter: an x-ray reported after the letter asked for it is the letter's
+ * x-ray, an appointment already attended is a different one. An open step with
+ * no date of its own is a step still waiting, so a letter chasing it is chasing
+ * this one; an undated letter or an undated finished step is no evidence either
+ * way, and the promise stays with what is already on the graph rather than
+ * opening a second instance of what may well be the same step.
+ */
+function stillAhead(node: GraphNode, letterDate: string | null): boolean {
+  if (!letterDate) return true;
+  const ownDay = COMPLETED.has(node.status) ? timelineOf(node) : node.dueDate;
+  return ownDay === null || ownDay > letterDate;
+}
+
+/**
  * Turn the waits the letters promise in words into dates on the steps they
  * promise them for. "FU 4 weeks" in a letter of 23 Jun is a due date of 21 Jul;
  * "culture negative at six weeks" counted from a bronchoscopy is six weeks from
@@ -1113,9 +1133,13 @@ function applyFollowUps(
     const named = findNodes(nodes, followUp.item, { preferOpen: true });
     // The letters promise the NEXT one; a step already carried out keeps its own
     // dates. When every step the line names is done, the promise is kept — there
-    // is nothing left to be due.
-    let targets = named.filter((node) => !COMPLETED.has(node.status));
-    if (!named.length) {
+    // is nothing left to be due. But only a step whose own day is still ahead of
+    // the letter can be the one it is promising: reading "FU 4 weeks" as the
+    // appointment the patient attended that same morning silently threw the new
+    // promise away, and with it the only overdue step on the pathway.
+    let targets = named.filter((node) => !COMPLETED.has(node.status) && stillAhead(node, letterDate));
+    const kept = named.some((node) => stillAhead(node, letterDate));
+    if (!targets.length && !kept) {
       const label = displayLabel(followUp.item);
       // A promised item is filed under the type its NAME implies, not assumed to
       // be an appointment: "repeat non-contrast CT" is the CT already on the
@@ -1138,6 +1162,11 @@ function applyFollowUps(
         node.kind === "investigation" &&
         (unknownType || node.invType === invType) &&
         !COMPLETED.has(node.status) &&
+        // An appointment booked for a day that has already come is spent, even
+        // if nothing has written it up as attended yet. The next promise of the
+        // same thing is the next one, not a second due date on the old one —
+        // which the earliest-promise-wins rule below would have discarded.
+        stillAhead(node, letterDate) &&
         sameStep(tokensById.get(node.id) ?? new Set(), key, unknownType),
       );
       if (!target) {
